@@ -2,13 +2,13 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
 	"math/rand/v2"
 	"regexp"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -19,44 +19,90 @@ import (
 	"consumer-dispatcher/internal/metrics"
 )
 
+const (
+	initialBackoff    = 100 * time.Millisecond
+	maxBackoff        = 5 * time.Second
+	dlqPublishTimeout = 10 * time.Second
+)
+
+// Outcome labels for metrics.Processed.
+const (
+	outcomeSuccess   = "success"
+	outcomeDiscarded = "discarded"
+	outcomeDLQ       = "dlq"
+	outcomeFailed    = "failed"
+	outcomeRequeued  = "requeued"
+)
+
+// ChannelSource opens AMQP channels. Implemented by *broker.Hub.
+type ChannelSource interface {
+	Channel(serverName string, srv config.Server) (*amqp.Channel, error)
+}
+
+// Forwarder posts one message to the HTTP consumer. Implemented by *forward.Client.
+type Forwarder interface {
+	Post(ctx context.Context, endpoint, hostHeader, queueName, body string) forward.Result
+}
+
+type publisher interface {
+	Publish(ctx context.Context, queue string, msg amqp.Publishing) error
+}
+
 // Worker consumes one RabbitMQ queue and forwards messages over HTTP.
-// Lifecycle is controlled via stop (chan struct{}), not a stored context.
+//
+// Stopping is two-phase: requestStop stops taking new deliveries and lets the
+// in-flight message finish; abort additionally cancels the in-flight message,
+// which is then requeued rather than dead-lettered.
 type Worker struct {
-	job    config.ResolvedJob
-	hub    *broker.Hub
-	client *forward.Client
-	log    *slog.Logger
+	job   config.ResolvedJob
+	src   ChannelSource
+	fwd   Forwarder
+	log   *slog.Logger
+	stats *Stats
 
 	stop     chan struct{}
 	stopOnce sync.Once
+	abort    context.CancelFunc
 	done     chan struct{}
-
-	completed atomic.Int64
-	failed    atomic.Int64
 }
 
-func newWorker(job config.ResolvedJob, hub *broker.Hub, client *forward.Client, log *slog.Logger) *Worker {
+func newWorker(job config.ResolvedJob, src ChannelSource, fwd Forwarder, stats *Stats, log *slog.Logger) *Worker {
 	return &Worker{
-		job:    job,
-		hub:    hub,
-		client: client,
-		log:    log.With("job", job.LogicName),
-		stop:   make(chan struct{}),
-		done:   make(chan struct{}),
+		job:   job,
+		src:   src,
+		fwd:   fwd,
+		log:   log.With("job", job.LogicName),
+		stats: stats,
+		stop:  make(chan struct{}),
+		done:  make(chan struct{}),
 	}
 }
 
-func (w *Worker) start() { go w.loop() }
-
-func (w *Worker) Stop() {
-	w.stopOnce.Do(func() { close(w.stop) })
-	<-w.done
+func (w *Worker) start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w.abort = cancel
+	go w.loop(ctx)
 }
 
-func (w *Worker) Completed() int64        { return w.completed.Load() }
-func (w *Worker) Failed() int64           { return w.failed.Load() }
-func (w *Worker) Job() config.ResolvedJob { return w.job }
-func (w *Worker) stopped() bool {
+// requestStop asks the worker to stop after the in-flight message. Non-blocking.
+func (w *Worker) requestStop() {
+	w.stopOnce.Do(func() { close(w.stop) })
+}
+
+// shutdown stops the worker and waits for it. If ctx ends first, the in-flight
+// message is aborted (and requeued) before waiting for the worker to exit.
+func (w *Worker) shutdown(ctx context.Context) {
+	w.requestStop()
+	select {
+	case <-w.done:
+	case <-ctx.Done():
+		w.abort()
+		<-w.done
+	}
+	w.abort()
+}
+
+func (w *Worker) stopping() bool {
 	select {
 	case <-w.stop:
 		return true
@@ -65,82 +111,98 @@ func (w *Worker) stopped() bool {
 	}
 }
 
-func (w *Worker) loop() {
+func (w *Worker) loop(ctx context.Context) {
 	defer close(w.done)
 	for {
-		if w.stopped() {
+		err := w.consumeOnce(ctx)
+		if w.stopping() {
 			return
 		}
-		if err := w.consumeOnce(); err != nil {
-			if w.stopped() {
-				return
-			}
-			w.log.Error("consume session ended", "err", err)
-			select {
-			case <-w.stop:
-				return
-			case <-time.After(time.Duration(w.job.Server.ReconnectSeconds) * time.Second):
-			}
+		w.log.Error("consume session ended", "err", err)
+		select {
+		case <-w.stop:
+			return
+		case <-time.After(time.Duration(w.job.Server.ReconnectSeconds) * time.Second):
 		}
 	}
 }
 
-func (w *Worker) consumeOnce() error {
-	ch, err := w.hub.Channel(w.job.ServerName, w.job.Server)
+// consumeOnce runs one consume session. It returns nil only when stopping.
+func (w *Worker) consumeOnce(ctx context.Context) error {
+	var blockRe *regexp.Regexp
+	if w.job.BlockPatterns != "" {
+		re, err := regexp.Compile(w.job.BlockPatterns)
+		if err != nil {
+			return fmt.Errorf("block_patterns: %w", err)
+		}
+		blockRe = re
+	}
+
+	ch, err := w.src.Channel(w.job.ServerName, w.job.Server)
 	if err != nil {
+		return fmt.Errorf("open channel: %w", err)
+	}
+	// Closing the channel requeues any prefetched but unacked deliveries.
+	defer func() {
+		if err := ch.Close(); err != nil && !errors.Is(err, amqp.ErrClosed) {
+			w.log.Warn("channel close", "err", err)
+		}
+	}()
+
+	if err := prepareTopology(ch, w.job); err != nil {
 		return err
 	}
-	defer ch.Close()
-
-	if w.job.DeclareTopology {
-		if err := declareTopology(ch, w.job); err != nil {
-			return err
-		}
-	} else if _, err := ch.QueueDeclarePassive(w.job.Queue, w.job.QueueDurable, false, false, false, nil); err != nil {
-		return fmt.Errorf("queue passive: %w", err)
-	}
-
 	if err := ch.Qos(w.job.Prefetch, 0, false); err != nil {
 		return fmt.Errorf("qos: %w", err)
 	}
+	pub, err := broker.NewPublisher(ch)
+	if err != nil {
+		return err
+	}
+	closeErr := ch.NotifyClose(make(chan *amqp.Error, 1))
 
 	deliveries, err := ch.Consume(w.job.Queue, "", false, false, false, false, nil)
 	if err != nil {
 		return fmt.Errorf("consume: %w", err)
 	}
-
 	w.log.Info("consuming", "queue", w.job.Queue, "url", w.job.URL)
 
-	closeErr := make(chan *amqp.Error, 1)
-	ch.NotifyClose(closeErr)
-
-	var blockRe *regexp.Regexp
-	if w.job.BlockPatterns != "" {
-		blockRe, err = regexp.Compile(w.job.BlockPatterns)
-		if err != nil {
-			return fmt.Errorf("block_patterns: %w", err)
-		}
-	}
-
 	for {
+		// Give stop priority over deliveries that are already buffered.
+		if w.stopping() {
+			return nil
+		}
 		select {
 		case <-w.stop:
 			return nil
+		case <-ctx.Done():
+			return nil
 		case amqpErr := <-closeErr:
 			if amqpErr != nil {
-				return fmt.Errorf("channel closed: %w", error(amqpErr))
+				return fmt.Errorf("channel closed: %s", amqpErr.Error())
 			}
-			return fmt.Errorf("channel closed")
+			return errors.New("channel closed")
 		case d, ok := <-deliveries:
 			if !ok {
-				return fmt.Errorf("delivery channel closed")
+				return errors.New("delivery channel closed")
 			}
-			w.handle(ch, blockRe, d)
+			w.handle(ctx, pub, blockRe, d)
 		}
 	}
 }
 
-func declareTopology(ch *amqp.Channel, job config.ResolvedJob) error {
+func prepareTopology(ch *amqp.Channel, job config.ResolvedJob) error {
+	if !job.DeclareTopology {
+		// Topology is managed elsewhere; verify both queues exist so failed
+		// messages are never published to a missing DLQ.
+		if _, err := ch.QueueDeclarePassive(job.Queue, job.QueueDurable, false, false, false, nil); err != nil {
+			return fmt.Errorf("queue passive: %w", err)
+		}
+		if _, err := ch.QueueDeclarePassive(job.DLQ, true, false, false, false, nil); err != nil {
+			return fmt.Errorf("dlq passive: %w", err)
+		}
+		return nil
+	}
 	if err := ch.ExchangeDeclare(job.Exchange, job.Type, job.ExchangeDurable, false, false, false, nil); err != nil {
 		return fmt.Errorf("exchange declare: %w", err)
 	}
@@ -156,7 +218,8 @@ func declareTopology(ch *amqp.Channel, job config.ResolvedJob) error {
 	return nil
 }
 
-func (w *Worker) handle(ch *amqp.Channel, blockRe *regexp.Regexp, d amqp.Delivery) {
+// handle processes one delivery. ctx is cancelled only when the worker is aborted.
+func (w *Worker) handle(ctx context.Context, pub publisher, blockRe *regexp.Regexp, d amqp.Delivery) {
 	metrics.InFlight.WithLabelValues(w.job.LogicName).Inc()
 	defer metrics.InFlight.WithLabelValues(w.job.LogicName).Dec()
 
@@ -164,192 +227,121 @@ func (w *Worker) handle(ch *amqp.Channel, blockRe *regexp.Regexp, d amqp.Deliver
 	if blockRe != nil && blockRe.MatchString(body) {
 		w.log.Info("matched block pattern", "pattern", w.job.BlockPatterns)
 		if w.job.DiscardMatchJobs {
-			_ = d.Ack(false)
-			w.completed.Add(1)
-			metrics.Processed.WithLabelValues(w.job.LogicName, "discarded").Inc()
+			w.ack(d, outcomeDiscarded)
+			w.stats.completed.Add(1)
 			return
 		}
 	}
 
-	baseCtx, stopCancel := contextFromStop(w.stop)
-	defer stopCancel()
-
 	start := time.Now()
-	ok := w.forwardWithRetry(baseCtx, body)
+	ok := w.forwardWithRetry(ctx, body)
 	metrics.Duration.WithLabelValues(w.job.LogicName).Observe(time.Since(start).Seconds())
 
-	if ok {
-		_ = d.Ack(false)
-		w.completed.Add(1)
-		metrics.Processed.WithLabelValues(w.job.LogicName, "success").Inc()
-		return
+	switch {
+	case ok:
+		w.ack(d, outcomeSuccess)
+		w.stats.completed.Add(1)
+	case ctx.Err() != nil:
+		// Aborted by shutdown, not a consumer failure: give it back to the queue.
+		w.log.Info("aborted in-flight message, requeue")
+		w.nack(d, outcomeRequeued)
+	default:
+		w.deadLetter(ctx, pub, d)
 	}
-
-	pubCtx, cancel := context.WithTimeout(baseCtx, 10*time.Second)
-	err := publishDLQ(pubCtx, ch, w.job, d)
-	cancel()
-	if err != nil {
-		w.log.Error("publish dlq failed, nack requeue", "err", err)
-		_ = d.Nack(false, true)
-		w.failed.Add(1)
-		metrics.Processed.WithLabelValues(w.job.LogicName, "failed").Inc()
-		return
-	}
-	_ = d.Ack(false)
-	w.failed.Add(1)
-	metrics.Processed.WithLabelValues(w.job.LogicName, "dlq").Inc()
 }
 
-func (w *Worker) forwardWithRetry(parent context.Context, body string) bool {
-	attempts := max(w.job.RetryLimit, 1)
-	total := 1 + attempts
-	backoff := time.Duration(50+rand.IntN(50)) * time.Millisecond
+func (w *Worker) deadLetter(ctx context.Context, pub publisher, d amqp.Delivery) {
+	pubCtx, cancel := context.WithTimeout(ctx, dlqPublishTimeout)
+	defer cancel()
+
+	if err := pub.Publish(pubCtx, w.job.DLQ, dlqMessage(w.job, d)); err != nil {
+		if ctx.Err() != nil {
+			w.nack(d, outcomeRequeued)
+			return
+		}
+		w.log.Error("publish dlq failed, nack requeue", "err", err)
+		w.nack(d, outcomeFailed)
+		w.stats.failed.Add(1)
+		return
+	}
+	w.ack(d, outcomeDLQ)
+	w.stats.failed.Add(1)
+}
+
+func (w *Worker) ack(d amqp.Delivery, outcome string) {
+	if err := d.Ack(false); err != nil {
+		// The broker will redeliver it; the consumer may see a duplicate.
+		w.log.Warn("ack failed", "outcome", outcome, "err", err)
+	}
+	metrics.Processed.WithLabelValues(w.job.LogicName, outcome).Inc()
+}
+
+func (w *Worker) nack(d amqp.Delivery, outcome string) {
+	if err := d.Nack(false, true); err != nil {
+		w.log.Warn("nack failed", "outcome", outcome, "err", err)
+	}
+	metrics.Processed.WithLabelValues(w.job.LogicName, outcome).Inc()
+}
+
+// forwardWithRetry makes 1 + RetryLimit attempts with jittered exponential backoff.
+func (w *Worker) forwardWithRetry(ctx context.Context, body string) bool {
+	total := 1 + w.job.RetryLimit
+	backoff := initialBackoff
 
 	for i := range total {
-		if err := parent.Err(); err != nil {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return false
+			case <-time.After(jitter(backoff)):
+			}
+			backoff = min(backoff*2, maxBackoff)
+		}
+		if ctx.Err() != nil {
 			return false
 		}
-		ctx, cancel := context.WithTimeout(parent, w.job.Timeout)
-		res := w.client.Post(ctx, w.job.URL, w.job.URLHost, w.job.Name, body)
+		attemptCtx, cancel := context.WithTimeout(ctx, w.job.Timeout)
+		res := w.fwd.Post(attemptCtx, w.job.URL, w.job.URLHost, w.job.Name, body)
 		cancel()
 		if res.OK {
-			w.log.Info("forward ok", "attempt", i+1, "result", res.Body)
+			w.log.Debug("forward ok", "attempt", i+1, "result", res.Body)
 			return true
 		}
-		w.log.Warn("forward failed", "attempt", i+1, "result", res.Body, "err", res.Err)
-		if i == total-1 {
-			break
-		}
-		select {
-		case <-parent.Done():
-			return false
-		case <-time.After(backoff):
-		}
-		backoff = min(backoff*2, 5*time.Second)
+		w.log.Warn("forward failed", "attempt", i+1, "of", total, "result", res.Body, "err", res.Err)
 	}
 	return false
 }
 
-// contextFromStop returns a context cancelled when stop is closed.
-// Context is not stored on the worker; callers must cancel when done.
-func contextFromStop(stop <-chan struct{}) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		select {
-		case <-stop:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
-	return ctx, cancel
+// jitter returns a random duration in [d/2, d].
+func jitter(d time.Duration) time.Duration {
+	half := d / 2
+	return half + rand.N(half+1)
 }
 
-func publishDLQ(ctx context.Context, ch *amqp.Channel, job config.ResolvedJob, d amqp.Delivery) error {
+func dlqMessage(job config.ResolvedJob, d amqp.Delivery) amqp.Publishing {
 	headers := amqp.Table{}
 	maps.Copy(headers, d.Headers)
 	headers["x-original-queue"] = job.Queue
 	headers["x-job"] = job.LogicName
 	headers["x-failed-at"] = time.Now().UTC().Format(time.RFC3339)
 
-	return ch.PublishWithContext(ctx, "", job.DLQ, false, false, amqp.Publishing{
+	return amqp.Publishing{
 		Headers:         headers,
 		ContentType:     d.ContentType,
 		ContentEncoding: d.ContentEncoding,
 		Body:            d.Body,
 		DeliveryMode:    amqp.Persistent,
 		Timestamp:       time.Now(),
-	})
+	}
 }
 
 // Try posts a one-off body without touching the queue (admin).
-func Try(ctx context.Context, client *forward.Client, job config.ResolvedJob, body string) (string, error) {
+func Try(ctx context.Context, fwd Forwarder, job config.ResolvedJob, body string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, job.Timeout)
 	defer cancel()
-	res := client.Post(ctx, job.URL, job.URLHost, job.Name, body)
+	res := fwd.Post(ctx, job.URL, job.URLHost, job.Name, body)
 	if res.Err != nil {
 		return res.Body, res.Err
 	}
 	return res.Body, nil
-}
-
-// Pool manages N workers for one job and supports scaling.
-type Pool struct {
-	mu      sync.Mutex
-	job     config.ResolvedJob
-	hub     *broker.Hub
-	client  *forward.Client
-	log     *slog.Logger
-	workers []*Worker
-}
-
-func NewPool(job config.ResolvedJob, hub *broker.Hub, client *forward.Client, log *slog.Logger) *Pool {
-	return &Pool{job: job, hub: hub, client: client, log: log}
-}
-
-func (p *Pool) Start(n int) {
-	p.SetWorkers(n)
-}
-
-func (p *Pool) SetWorkers(n int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if n < 0 {
-		n = 0
-	}
-	p.setLocked(n)
-}
-
-func (p *Pool) setLocked(n int) {
-	cur := len(p.workers)
-	switch {
-	case n > cur:
-		for range n - cur {
-			w := newWorker(p.job, p.hub, p.client, p.log)
-			w.start()
-			p.workers = append(p.workers, w)
-		}
-	case n < cur:
-		stopped := p.workers[n:]
-		p.workers = p.workers[:n]
-		for _, w := range stopped {
-			w.Stop()
-		}
-	}
-	metrics.Workers.WithLabelValues(p.job.LogicName).Set(float64(len(p.workers)))
-}
-
-func (p *Pool) Stop() { p.SetWorkers(0) }
-
-func (p *Pool) WorkerCount() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return len(p.workers)
-}
-
-func (p *Pool) Stats() (completed, failed int64, workers int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, w := range p.workers {
-		completed += w.Completed()
-		failed += w.Failed()
-	}
-	return completed, failed, len(p.workers)
-}
-
-func (p *Pool) Job() config.ResolvedJob {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.job
-}
-
-func (p *Pool) UpdateJob(mut func(*config.ResolvedJob)) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	n := len(p.workers)
-	for _, w := range p.workers {
-		w.Stop()
-	}
-	p.workers = nil
-	mut(&p.job)
-	p.setLocked(n)
 }

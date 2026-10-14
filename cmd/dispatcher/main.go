@@ -17,7 +17,14 @@ import (
 	"consumer-dispatcher/internal/manager"
 )
 
+// shutdownTimeout bounds the whole shutdown (HTTP drain + consumers).
+const shutdownTimeout = 15 * time.Second
+
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	cfgPath := flag.String("config", envOr("CD_CONFIG", "configs/config.yaml"), "path to YAML config")
 	flag.Parse()
 
@@ -27,7 +34,7 @@ func main() {
 	cfg, jobs, err := config.Load(*cfgPath)
 	if err != nil {
 		log.Error("load config", "err", err)
-		os.Exit(1)
+		return 1
 	}
 	log.Info("config loaded", "jobs", len(jobs), "servers", len(cfg.Servers), "admin", cfg.Admin.Addr())
 
@@ -41,6 +48,10 @@ func main() {
 		Addr:              cfg.Admin.Addr(),
 		Handler:           admin.New(mgr, log).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		// /try waits for the consumer, so allow the longest job timeout.
+		WriteTimeout: manager.MaxJobTimeout(jobs) + 10*time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
@@ -51,22 +62,26 @@ func main() {
 		}
 	}()
 
+	code := 0
 	select {
 	case <-ctx.Done():
 		log.Info("shutdown signal received")
 	case err := <-errCh:
 		log.Error("admin server", "err", err)
+		code = 1
 	}
 
-	// Reverse order: HTTP drain → consumers → broker connections.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// Reverse order: HTTP drain → consumers (finish in-flight, requeue on
+	// timeout) → broker connections. One deadline covers all of it.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("admin shutdown", "err", err)
 	}
-	mgr.StopAll()
+	mgr.StopAll(shutdownCtx)
 	log.Info("bye")
+	return code
 }
 
 func envOr(key, def string) string {

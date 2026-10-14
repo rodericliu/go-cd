@@ -1,10 +1,13 @@
 package manager
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,30 +20,39 @@ import (
 	"consumer-dispatcher/internal/worker"
 )
 
-// ErrJobNotFound is returned when a job id does not match any pool.
-var ErrJobNotFound = errors.New("job not found")
+const (
+	// MaxWorkers caps workers per job set through the admin API.
+	MaxWorkers = 256
+	// MaxPeek caps messages returned by one peek/take/dlq/replay call.
+	MaxPeek = 100
+
+	defaultPeek = 10
+)
+
+var (
+	// ErrJobNotFound is returned when a job id does not match any pool.
+	ErrJobNotFound = errors.New("job not found")
+	// ErrAmbiguousJob is returned when a bare job name matches several servers.
+	ErrAmbiguousJob = errors.New("job name is ambiguous")
+	// ErrInvalidArgument is returned for out-of-range or malformed admin input.
+	ErrInvalidArgument = errors.New("invalid argument")
+)
 
 // Manager owns shared broker connections and all job worker pools.
 type Manager struct {
-	mu     sync.RWMutex
-	pools  map[string]*worker.Pool
+	pools  map[string]*worker.Pool // immutable after New
 	hub    *broker.Hub
 	client *forward.Client
 	log    *slog.Logger
 	ready  atomic.Bool
 }
 
+// New creates pools for jobs; call StartAll to begin consuming.
 func New(jobs []config.ResolvedJob, log *slog.Logger) *Manager {
-	maxTimeout := 30 * time.Second
-	for _, j := range jobs {
-		if j.Timeout > maxTimeout {
-			maxTimeout = j.Timeout
-		}
-	}
 	m := &Manager{
 		pools:  make(map[string]*worker.Pool, len(jobs)),
 		hub:    broker.NewHub(log),
-		client: forward.New(maxTimeout + 5*time.Second),
+		client: forward.New(MaxJobTimeout(jobs) + 5*time.Second),
 		log:    log,
 	}
 	for _, j := range jobs {
@@ -49,64 +61,56 @@ func New(jobs []config.ResolvedJob, log *slog.Logger) *Manager {
 	return m
 }
 
+// MaxJobTimeout returns the largest per-request timeout among jobs (at least 30s).
+func MaxJobTimeout(jobs []config.ResolvedJob) time.Duration {
+	maxTimeout := 30 * time.Second
+	for _, j := range jobs {
+		maxTimeout = max(maxTimeout, j.Timeout)
+	}
+	return maxTimeout
+}
+
+// StartAll starts every pool with its configured worker count.
 func (m *Manager) StartAll() {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
 	for _, p := range m.pools {
 		j := p.Job()
 		m.log.Info("starting job", "job", j.String())
-		p.Start(j.Count)
+		p.SetWorkers(j.Count)
 	}
 	m.ready.Store(true)
 }
 
-func (m *Manager) StopAll() {
+// StopAll marks the manager not ready, stops all pools and closes broker
+// connections. In-flight messages are aborted and requeued when ctx ends.
+func (m *Manager) StopAll(ctx context.Context) {
 	m.ready.Store(false)
-	m.mu.RLock()
-	pools := make([]*worker.Pool, 0, len(m.pools))
-	for _, p := range m.pools {
-		pools = append(pools, p)
-	}
-	m.mu.RUnlock()
-
 	var wg sync.WaitGroup
-	for _, p := range pools {
-		wg.Go(p.Stop)
+	for _, p := range m.pools {
+		wg.Go(func() { p.Shutdown(ctx) })
 	}
 	wg.Wait()
 	m.hub.Close()
 }
 
+// Ready reports whether StartAll has run and StopAll has not.
 func (m *Manager) Ready() bool { return m.ready.Load() }
 
-func (m *Manager) Hub() *broker.Hub { return m.hub }
-
-func (m *Manager) List() []JobStatus {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	out := make([]JobStatus, 0, len(m.pools))
+// Ping verifies connectivity to every RabbitMQ server used by a job.
+func (m *Manager) Ping(ctx context.Context) error {
+	servers := make(map[string]config.Server)
 	for _, p := range m.pools {
 		j := p.Job()
-		ok, fail, n := p.Stats()
-		out = append(out, JobStatus{
-			LogicName:        j.LogicName,
-			Name:             j.Name,
-			Server:           j.ServerName,
-			Queue:            j.Queue,
-			URL:              j.URL,
-			Workers:          n,
-			Completed:        ok,
-			Failed:           fail,
-			Prefetch:         j.Prefetch,
-			RetryLimit:       j.RetryLimit,
-			DLQ:              j.DLQ,
-			BlockPatterns:    j.BlockPatterns,
-			DiscardMatchJobs: j.DiscardMatchJobs,
-		})
+		servers[j.ServerName] = j.Server
 	}
-	return out
+	for name, srv := range servers {
+		if err := m.hub.Ping(ctx, name, srv); err != nil {
+			return fmt.Errorf("server %q: %w", name, err)
+		}
+	}
+	return nil
 }
 
+// JobStatus is the admin view of one job.
 type JobStatus struct {
 	LogicName        string `json:"logic_name"`
 	Name             string `json:"name"`
@@ -123,36 +127,74 @@ type JobStatus struct {
 	DiscardMatchJobs bool   `json:"discard_match_jobs"`
 }
 
-func (m *Manager) pool(logicName string) (*worker.Pool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	p, ok := m.pools[logicName]
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrJobNotFound, logicName)
+func status(p *worker.Pool) JobStatus {
+	j := p.Job()
+	ok, fail, n := p.Stats()
+	return JobStatus{
+		LogicName:        j.LogicName,
+		Name:             j.Name,
+		Server:           j.ServerName,
+		Queue:            j.Queue,
+		URL:              j.URL,
+		Workers:          n,
+		Completed:        ok,
+		Failed:           fail,
+		Prefetch:         j.Prefetch,
+		RetryLimit:       j.RetryLimit,
+		DLQ:              j.DLQ,
+		BlockPatterns:    j.BlockPatterns,
+		DiscardMatchJobs: j.DiscardMatchJobs,
 	}
-	return p, nil
 }
 
-func (m *Manager) resolveLogicName(id string) (string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if _, ok := m.pools[id]; ok {
-		return id, nil
-	}
+// List returns all jobs sorted by logic name.
+func (m *Manager) List() []JobStatus {
+	out := make([]JobStatus, 0, len(m.pools))
 	for _, p := range m.pools {
+		out = append(out, status(p))
+	}
+	slices.SortFunc(out, func(a, b JobStatus) int { return cmp.Compare(a.LogicName, b.LogicName) })
+	return out
+}
+
+// Get returns the status of one job.
+func (m *Manager) Get(id string) (JobStatus, error) {
+	p, err := m.pool(id)
+	if err != nil {
+		return JobStatus{}, err
+	}
+	return status(p), nil
+}
+
+// pool resolves id as a logic name ("name-server"), or as a bare job name when
+// that name is bound to exactly one server.
+func (m *Manager) pool(id string) (*worker.Pool, error) {
+	if p, ok := m.pools[id]; ok {
+		return p, nil
+	}
+	var matches []string
+	for logic, p := range m.pools {
 		if p.Job().Name == id {
-			return p.Job().LogicName, nil
+			matches = append(matches, logic)
 		}
 	}
-	return "", fmt.Errorf("%w: %s", ErrJobNotFound, id)
+	switch len(matches) {
+	case 0:
+		return nil, fmt.Errorf("%w: %s", ErrJobNotFound, id)
+	case 1:
+		return m.pools[matches[0]], nil
+	default:
+		slices.Sort(matches)
+		return nil, fmt.Errorf("%w: %q matches %s; use one of them", ErrAmbiguousJob, id, strings.Join(matches, ", "))
+	}
 }
 
+// SetWorkers scales a job to n workers (0..MaxWorkers).
 func (m *Manager) SetWorkers(id string, n int) error {
-	logic, err := m.resolveLogicName(id)
-	if err != nil {
-		return err
+	if n < 0 || n > MaxWorkers {
+		return fmt.Errorf("%w: count must be between 0 and %d", ErrInvalidArgument, MaxWorkers)
 	}
-	p, err := m.pool(logic)
+	p, err := m.pool(id)
 	if err != nil {
 		return err
 	}
@@ -160,12 +202,12 @@ func (m *Manager) SetWorkers(id string, n int) error {
 	return nil
 }
 
+// SetURL changes the consumer URL of a job.
 func (m *Manager) SetURL(id, rawURL string) error {
-	logic, err := m.resolveLogicName(id)
-	if err != nil {
-		return err
+	if err := config.ValidateURL(rawURL); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidArgument, err)
 	}
-	p, err := m.pool(logic)
+	p, err := m.pool(id)
 	if err != nil {
 		return err
 	}
@@ -173,12 +215,12 @@ func (m *Manager) SetURL(id, rawURL string) error {
 	return nil
 }
 
+// SetBlockPatterns changes the block regexp of a job ("" disables it).
 func (m *Manager) SetBlockPatterns(id, patterns string) error {
-	logic, err := m.resolveLogicName(id)
-	if err != nil {
-		return err
+	if err := config.ValidatePattern(patterns); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidArgument, err)
 	}
-	p, err := m.pool(logic)
+	p, err := m.pool(id)
 	if err != nil {
 		return err
 	}
@@ -186,12 +228,9 @@ func (m *Manager) SetBlockPatterns(id, patterns string) error {
 	return nil
 }
 
+// SetDiscardMatchJobs toggles whether blocked messages are discarded.
 func (m *Manager) SetDiscardMatchJobs(id string, discard bool) error {
-	logic, err := m.resolveLogicName(id)
-	if err != nil {
-		return err
-	}
-	p, err := m.pool(logic)
+	p, err := m.pool(id)
 	if err != nil {
 		return err
 	}
@@ -199,24 +238,17 @@ func (m *Manager) SetDiscardMatchJobs(id string, discard bool) error {
 	return nil
 }
 
+// Try posts body to the job's consumer without touching the queue.
 func (m *Manager) Try(ctx context.Context, id, body string) (string, error) {
-	logic, err := m.resolveLogicName(id)
-	if err != nil {
-		return "", err
-	}
-	p, err := m.pool(logic)
+	p, err := m.pool(id)
 	if err != nil {
 		return "", err
 	}
 	return worker.Try(ctx, m.client, p.Job(), body)
 }
 
-func (m *Manager) withChannel(ctx context.Context, id string, fn func(context.Context, *amqp.Channel, config.ResolvedJob) error) error {
-	logic, err := m.resolveLogicName(id)
-	if err != nil {
-		return err
-	}
-	p, err := m.pool(logic)
+func (m *Manager) withChannel(id string, fn func(*amqp.Channel, config.ResolvedJob) error) error {
+	p, err := m.pool(id)
 	if err != nil {
 		return err
 	}
@@ -225,38 +257,66 @@ func (m *Manager) withChannel(ctx context.Context, id string, fn func(context.Co
 	if err != nil {
 		return err
 	}
-	defer ch.Close()
-	return fn(ctx, ch, j)
+	defer func() {
+		if err := ch.Close(); err != nil && !errors.Is(err, amqp.ErrClosed) {
+			m.log.Warn("channel close", "err", err)
+		}
+	}()
+	return fn(ch, j)
 }
 
+// PurgeQueue removes all ready messages from the job's main queue.
 func (m *Manager) PurgeQueue(id string) (int, error) {
 	var n int
-	err := m.withChannel(context.Background(), id, func(_ context.Context, ch *amqp.Channel, j config.ResolvedJob) error {
-		count, err := ch.QueuePurge(j.Queue, false)
-		n = count
+	err := m.withChannel(id, func(ch *amqp.Channel, j config.ResolvedJob) error {
+		var err error
+		n, err = ch.QueuePurge(j.Queue, false)
 		return err
 	})
 	return n, err
 }
 
+// PurgeDLQ removes all ready messages from the job's DLQ.
 func (m *Manager) PurgeDLQ(id string) (int, error) {
 	var n int
-	err := m.withChannel(context.Background(), id, func(_ context.Context, ch *amqp.Channel, j config.ResolvedJob) error {
-		count, err := ch.QueuePurge(j.DLQ, false)
-		n = count
+	err := m.withChannel(id, func(ch *amqp.Channel, j config.ResolvedJob) error {
+		var err error
+		n, err = ch.QueuePurge(j.DLQ, false)
 		return err
 	})
 	return n, err
 }
 
+func peekCount(count int) (int, error) {
+	if count == 0 {
+		return defaultPeek, nil
+	}
+	if count < 0 || count > MaxPeek {
+		return 0, fmt.Errorf("%w: count must be between 1 and %d", ErrInvalidArgument, MaxPeek)
+	}
+	return count, nil
+}
+
+// Peek returns up to count bodies from the main queue (0 means default).
+// With ack=false the messages are returned to the queue when the channel closes.
 func (m *Manager) Peek(id string, count int, ack bool) ([]string, error) {
-	if count <= 0 {
-		count = 10
+	return m.get(id, count, ack, func(j config.ResolvedJob) string { return j.Queue })
+}
+
+// PeekDLQ returns up to count bodies from the DLQ without removing them.
+func (m *Manager) PeekDLQ(id string, count int) ([]string, error) {
+	return m.get(id, count, false, func(j config.ResolvedJob) string { return j.DLQ })
+}
+
+func (m *Manager) get(id string, count int, ack bool, queue func(config.ResolvedJob) string) ([]string, error) {
+	count, err := peekCount(count)
+	if err != nil {
+		return nil, err
 	}
 	msgs := make([]string, 0, count)
-	err := m.withChannel(context.Background(), id, func(_ context.Context, ch *amqp.Channel, j config.ResolvedJob) error {
+	err = m.withChannel(id, func(ch *amqp.Channel, j config.ResolvedJob) error {
 		for range count {
-			d, ok, err := ch.Get(j.Queue, ack)
+			d, ok, err := ch.Get(queue(j), ack)
 			if err != nil {
 				return err
 			}
@@ -270,66 +330,43 @@ func (m *Manager) Peek(id string, count int, ack bool) ([]string, error) {
 	return msgs, err
 }
 
-func (m *Manager) PeekDLQ(id string, count int) ([]string, error) {
-	if count <= 0 {
-		count = 10
+// ReplayDLQ moves up to count DLQ messages back to the main queue. Each
+// message is acked on the DLQ only after the broker confirms the republish.
+func (m *Manager) ReplayDLQ(ctx context.Context, id string, count int) (int, error) {
+	count, err := peekCount(count)
+	if err != nil {
+		return 0, err
 	}
-	msgs := make([]string, 0, count)
-	err := m.withChannel(context.Background(), id, func(_ context.Context, ch *amqp.Channel, j config.ResolvedJob) error {
+	replayed := 0
+	err = m.withChannel(id, func(ch *amqp.Channel, j config.ResolvedJob) error {
+		pub, err := broker.NewPublisher(ch)
+		if err != nil {
+			return err
+		}
 		for range count {
 			d, ok, err := ch.Get(j.DLQ, false)
 			if err != nil {
 				return err
 			}
 			if !ok {
-				break
+				return nil
 			}
-			msgs = append(msgs, string(d.Body))
-		}
-		return nil
-	})
-	return msgs, err
-}
-
-// ReplayDLQ re-publishes up to count DLQ messages back to the main queue.
-func (m *Manager) ReplayDLQ(ctx context.Context, id string, count int) (int, error) {
-	if count <= 0 {
-		count = 10
-	}
-	replayed := 0
-	err := m.withChannel(ctx, id, func(ctx context.Context, ch *amqp.Channel, j config.ResolvedJob) error {
-		for range count {
-			d, ok, err := ch.Get(j.DLQ, true)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				break
-			}
-			if err := ch.PublishWithContext(ctx, "", j.Queue, false, false, amqp.Publishing{
+			if err := pub.Publish(ctx, j.Queue, amqp.Publishing{
 				Headers:         d.Headers,
 				ContentType:     d.ContentType,
 				ContentEncoding: d.ContentEncoding,
 				Body:            d.Body,
 				DeliveryMode:    amqp.Persistent,
 			}); err != nil {
+				// Unacked: returned to the DLQ when the channel closes.
 				return fmt.Errorf("republish: %w", err)
+			}
+			if err := d.Ack(false); err != nil {
+				return fmt.Errorf("ack dlq message: %w", err)
 			}
 			replayed++
 		}
 		return nil
 	})
 	return replayed, err
-}
-
-// Servers returns unique server bindings for readiness checks.
-func (m *Manager) Servers() map[string]config.Server {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	out := make(map[string]config.Server)
-	for _, p := range m.pools {
-		j := p.Job()
-		out[j.ServerName] = j.Server
-	}
-	return out
 }
