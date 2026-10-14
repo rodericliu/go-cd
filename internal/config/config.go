@@ -1,7 +1,10 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -11,23 +14,30 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	defaultCount      = 1
+	defaultRetryLimit = 1
+)
+
 // File is the root YAML configuration.
 type File struct {
-	Defaults Defaults            `yaml:"defaults"`
-	Admin    Admin               `yaml:"admin"`
-	Servers  map[string]Server   `yaml:"servers"`
-	Jobs     []Job               `yaml:"jobs"`
+	Defaults Defaults          `yaml:"defaults"`
+	Admin    Admin             `yaml:"admin"`
+	Servers  map[string]Server `yaml:"servers"`
+	Jobs     []Job             `yaml:"jobs"`
 }
 
+// Defaults are applied to every job that leaves the field unset.
+// Count and RetryLimit are pointers so that an explicit 0 is distinguishable from "unset".
 type Defaults struct {
-	URL              string `yaml:"url"`
-	URLHost          string `yaml:"url_host"`
-	Count            int    `yaml:"count"`
-	TimeoutMS        int    `yaml:"timeout_ms"`
-	Encoding         string `yaml:"encoding"`
-	RetryLimit       int    `yaml:"retry_limit"`
-	Prefetch         int    `yaml:"prefetch"`
-	DeclareTopology  *bool  `yaml:"declare_topology"`
+	URL             string `yaml:"url"`
+	URLHost         string `yaml:"url_host"`
+	Count           *int   `yaml:"count"`
+	TimeoutMS       int    `yaml:"timeout_ms"`
+	Encoding        string `yaml:"encoding"`
+	RetryLimit      *int   `yaml:"retry_limit"`
+	Prefetch        int    `yaml:"prefetch"`
+	DeclareTopology *bool  `yaml:"declare_topology"`
 }
 
 type Admin struct {
@@ -36,34 +46,34 @@ type Admin struct {
 }
 
 type Server struct {
-	Host              string `yaml:"host"`
-	Port              int    `yaml:"port"`
-	Username          string `yaml:"username"`
-	Password          string `yaml:"password"`
-	VHost             string `yaml:"vhost"`
-	ReconnectSeconds  int    `yaml:"reconnect_seconds"`
+	Host             string `yaml:"host"`
+	Port             int    `yaml:"port"`
+	Username         string `yaml:"username"`
+	Password         string `yaml:"password"`
+	VHost            string `yaml:"vhost"`
+	ReconnectSeconds int    `yaml:"reconnect_seconds"`
 }
 
 type Job struct {
-	Name             string      `yaml:"name"`
-	Server           StringList  `yaml:"server"` // one name, or a list of server names
-	Queue            string      `yaml:"queue"`
-	Exchange         string      `yaml:"exchange"`
-	Type             string      `yaml:"type"`
-	URL              string      `yaml:"url"`
-	URLHost          string      `yaml:"url_host"`
-	Encoding         string      `yaml:"encoding"`
-	TimeoutMS        int         `yaml:"timeout_ms"`
-	Count            int         `yaml:"count"`
-	RetryLimit       int         `yaml:"retry_limit"`
-	Prefetch         int         `yaml:"prefetch"`
-	RouteKey         string      `yaml:"route_key"`
-	BlockPatterns    string      `yaml:"block_patterns"`
-	DiscardMatchJobs bool        `yaml:"discard_match_jobs"`
-	ExchangeDurable  *bool       `yaml:"exchange_durable"`
-	QueueDurable     *bool       `yaml:"queue_durable"`
-	DeclareTopology  *bool       `yaml:"declare_topology"`
-	DLQ              string      `yaml:"dlq"` // empty => queue + ".dlq"
+	Name             string     `yaml:"name"`
+	Server           StringList `yaml:"server"` // one name, or a list of server names
+	Queue            string     `yaml:"queue"`
+	Exchange         string     `yaml:"exchange"`
+	Type             string     `yaml:"type"`
+	URL              string     `yaml:"url"`
+	URLHost          string     `yaml:"url_host"`
+	Encoding         string     `yaml:"encoding"`
+	TimeoutMS        int        `yaml:"timeout_ms"`
+	Count            *int       `yaml:"count"`
+	RetryLimit       *int       `yaml:"retry_limit"`
+	Prefetch         int        `yaml:"prefetch"`
+	RouteKey         string     `yaml:"route_key"`
+	BlockPatterns    string     `yaml:"block_patterns"`
+	DiscardMatchJobs bool       `yaml:"discard_match_jobs"`
+	ExchangeDurable  *bool      `yaml:"exchange_durable"`
+	QueueDurable     *bool      `yaml:"queue_durable"`
+	DeclareTopology  *bool      `yaml:"declare_topology"`
+	DLQ              string     `yaml:"dlq"` // empty => queue + ".dlq"
 }
 
 // StringList unmarshals a YAML string or sequence of strings.
@@ -128,21 +138,34 @@ type ResolvedJob struct {
 	DLQ              string
 }
 
-var envPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)`)
+// Only ${VAR} and ${VAR:-default} are expanded; a bare "$" is kept literally
+// so values such as passwords may contain it.
+var envPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}`)
+
+var exchangeTypes = map[string]bool{"direct": true, "fanout": true, "topic": true, "headers": true}
 
 // Load reads YAML from path, expands ${ENV} / ${ENV:-default}, and resolves jobs.
+// Expansion runs on parsed scalar values, so environment values are never
+// re-interpreted as YAML syntax.
 func Load(path string) (*File, []ResolvedJob, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read config: %w", err)
 	}
-	expanded := expandEnv(string(raw))
 
-	var cfg File
-	if err := yaml.Unmarshal([]byte(expanded), &cfg); err != nil {
+	var root yaml.Node
+	if err := yaml.Unmarshal(raw, &root); err != nil {
 		return nil, nil, fmt.Errorf("parse yaml: %w", err)
 	}
-	applyDefaults(&cfg)
+	expandNode(&root)
+
+	var cfg File
+	if err := root.Decode(&cfg); err != nil {
+		return nil, nil, fmt.Errorf("parse yaml: %w", err)
+	}
+	if err := applyDefaults(&cfg); err != nil {
+		return nil, nil, err
+	}
 
 	jobs, err := resolveJobs(&cfg)
 	if err != nil {
@@ -151,18 +174,46 @@ func Load(path string) (*File, []ResolvedJob, error) {
 	return &cfg, jobs, nil
 }
 
-func applyDefaults(cfg *File) {
-	if cfg.Defaults.Count <= 0 {
-		cfg.Defaults.Count = 1
+func expandNode(n *yaml.Node) {
+	if n.Kind == yaml.ScalarNode {
+		expanded := expandEnv(n.Value)
+		if expanded != n.Value {
+			n.Value = expanded
+			// Re-resolve the type from the expanded value so "${PORT}" can
+			// fill an int field (string fields accept any scalar). A value
+			// that would resolve to null ("", "null", "~") stays a string so
+			// it is never silently dropped.
+			n.Style = 0
+			n.Tag = ""
+			if n.ShortTag() == "!!null" {
+				n.Tag = "!!str"
+			}
+		}
+		return
+	}
+	for _, c := range n.Content {
+		expandNode(c)
+	}
+}
+
+func applyDefaults(cfg *File) error {
+	if cfg.Defaults.Count == nil {
+		cfg.Defaults.Count = new(defaultCount)
+	}
+	if cfg.Defaults.RetryLimit == nil {
+		cfg.Defaults.RetryLimit = new(defaultRetryLimit)
+	}
+	if *cfg.Defaults.Count < 0 {
+		return errors.New("defaults.count must be >= 0")
+	}
+	if *cfg.Defaults.RetryLimit < 0 {
+		return errors.New("defaults.retry_limit must be >= 0")
 	}
 	if cfg.Defaults.TimeoutMS <= 0 {
 		cfg.Defaults.TimeoutMS = 30000
 	}
 	if cfg.Defaults.Encoding == "" {
 		cfg.Defaults.Encoding = "utf-8"
-	}
-	if cfg.Defaults.RetryLimit <= 0 {
-		cfg.Defaults.RetryLimit = 1
 	}
 	if cfg.Defaults.Prefetch <= 0 {
 		cfg.Defaults.Prefetch = 1
@@ -173,20 +224,22 @@ func applyDefaults(cfg *File) {
 	if cfg.Admin.Port <= 0 {
 		cfg.Admin.Port = 8888
 	}
+	return nil
 }
 
 func resolveJobs(cfg *File) ([]ResolvedJob, error) {
 	if len(cfg.Servers) == 0 {
-		return nil, fmt.Errorf("no servers defined")
+		return nil, errors.New("no servers defined")
 	}
 	if len(cfg.Jobs) == 0 {
-		return nil, fmt.Errorf("no jobs defined")
+		return nil, errors.New("no jobs defined")
 	}
 
 	out := make([]ResolvedJob, 0, len(cfg.Jobs))
 	seen := map[string]struct{}{}
 
 	for i, j := range cfg.Jobs {
+		j.Name = strings.TrimSpace(j.Name)
 		if j.Name == "" {
 			return nil, fmt.Errorf("jobs[%d]: name is required", i)
 		}
@@ -216,8 +269,8 @@ func resolveJobs(cfg *File) ([]ResolvedJob, error) {
 				URLHost:          firstNonEmpty(j.URLHost, cfg.Defaults.URLHost),
 				Encoding:         firstNonEmpty(j.Encoding, cfg.Defaults.Encoding),
 				Timeout:          time.Duration(pickPositive(j.TimeoutMS, cfg.Defaults.TimeoutMS)) * time.Millisecond,
-				Count:            pickPositive(j.Count, cfg.Defaults.Count),
-				RetryLimit:       pickPositive(j.RetryLimit, cfg.Defaults.RetryLimit),
+				Count:            intOrDefault(j.Count, *cfg.Defaults.Count),
+				RetryLimit:       intOrDefault(j.RetryLimit, *cfg.Defaults.RetryLimit),
 				Prefetch:         pickPositive(j.Prefetch, cfg.Defaults.Prefetch),
 				RouteKey:         j.RouteKey,
 				BlockPatterns:    j.BlockPatterns,
@@ -227,8 +280,8 @@ func resolveJobs(cfg *File) ([]ResolvedJob, error) {
 				DeclareTopology:  declare,
 				DLQ:              firstNonEmpty(j.DLQ, firstNonEmpty(j.Queue, j.Name)+".dlq"),
 			}
-			if rj.URL == "" {
-				return nil, fmt.Errorf("job %q: url is required (set job.url or defaults.url)", j.Name)
+			if err := validateJob(rj); err != nil {
+				return nil, fmt.Errorf("job %q: %w", j.Name, err)
 			}
 			if _, dup := seen[rj.LogicName]; dup {
 				return nil, fmt.Errorf("duplicate job logic name %q", rj.LogicName)
@@ -238,6 +291,54 @@ func resolveJobs(cfg *File) ([]ResolvedJob, error) {
 		}
 	}
 	return out, nil
+}
+
+func validateJob(j ResolvedJob) error {
+	if j.URL == "" {
+		return errors.New("url is required (set job.url or defaults.url)")
+	}
+	if err := ValidateURL(j.URL); err != nil {
+		return err
+	}
+	if err := ValidatePattern(j.BlockPatterns); err != nil {
+		return err
+	}
+	if !exchangeTypes[j.Type] {
+		return fmt.Errorf("type %q: want direct, fanout, topic or headers", j.Type)
+	}
+	if j.Count < 0 {
+		return errors.New("count must be >= 0")
+	}
+	if j.RetryLimit < 0 {
+		return errors.New("retry_limit must be >= 0")
+	}
+	return nil
+}
+
+// ValidateURL reports whether raw is an absolute http(s) URL with a host.
+func ValidateURL(raw string) error {
+	u, err := url.ParseRequestURI(raw)
+	if err != nil {
+		return fmt.Errorf("url %q: %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("url %q: scheme must be http or https", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("url %q: host is required", raw)
+	}
+	return nil
+}
+
+// ValidatePattern reports whether p is empty or a valid regular expression.
+func ValidatePattern(p string) error {
+	if p == "" {
+		return nil
+	}
+	if _, err := regexp.Compile(p); err != nil {
+		return fmt.Errorf("block_patterns: %w", err)
+	}
+	return nil
 }
 
 func validateServer(name string, s Server) error {
@@ -266,23 +367,17 @@ func withServerDefaults(s Server) Server {
 func expandEnv(s string) string {
 	return envPattern.ReplaceAllStringFunc(s, func(m string) string {
 		sub := envPattern.FindStringSubmatch(m)
-		if sub[1] != "" {
-			if v, ok := os.LookupEnv(sub[1]); ok {
-				return v
-			}
-			return sub[2] // default after :-
+		if v, ok := os.LookupEnv(sub[1]); ok {
+			return v
 		}
-		if sub[3] != "" {
-			return os.Getenv(sub[3])
-		}
-		return m
+		return sub[2] // default after :-
 	})
 }
 
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
-		if strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
+		if s := strings.TrimSpace(v); s != "" {
+			return s
 		}
 	}
 	return ""
@@ -295,25 +390,18 @@ func pickPositive(v, def int) int {
 	return def
 }
 
-func boolOrDefault(p *bool, def bool) bool {
+func intOrDefault(p *int, def int) int {
 	if p == nil {
 		return def
 	}
 	return *p
 }
 
-// AMQPURL builds an amqp URL (password redacted when redact=true).
-func (s Server) AMQPURL(redact bool) string {
-	pass := s.Password
-	if redact {
-		pass = "***"
+func boolOrDefault(p *bool, def bool) bool {
+	if p == nil {
+		return def
 	}
-	vhost := s.VHost
-	if !strings.HasPrefix(vhost, "/") {
-		vhost = "/" + vhost
-	}
-	// amqp path is URL-escaped vhost; keep simple for common cases
-	return fmt.Sprintf("amqp://%s:%s@%s:%d%s", s.Username, pass, s.Host, s.Port, vhost)
+	return *p
 }
 
 func (j ResolvedJob) String() string {
@@ -323,5 +411,5 @@ func (j ResolvedJob) String() string {
 
 // Addr returns admin listen address.
 func (a Admin) Addr() string {
-	return a.Host + ":" + strconv.Itoa(a.Port)
+	return net.JoinHostPort(a.Host, strconv.Itoa(a.Port))
 }
