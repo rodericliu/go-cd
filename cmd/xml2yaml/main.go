@@ -33,7 +33,8 @@ func main() {
 		_, _ = os.Stdout.Write(yamlBytes)
 		return
 	}
-	if err := os.WriteFile(*out, yamlBytes, 0o644); err != nil {
+	// The output may contain plaintext passwords.
+	if err := os.WriteFile(*out, yamlBytes, 0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "xml2yaml: write %s: %v\n", *out, err)
 		os.Exit(1)
 	}
