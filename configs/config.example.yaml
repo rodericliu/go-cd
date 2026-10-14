@@ -1,0 +1,55 @@
+# Consumer Dispatcher (Go) — copy to config.yaml and fill secrets via env.
+# Supports ${VAR} and ${VAR:-default} expansion.
+
+defaults:
+  url: ${CONSUMER_URL:-http://127.0.0.1:8080/consumerDispatch/dispatch}
+  url_host: ""
+  count: 1
+  timeout_ms: 30000
+  encoding: utf-8
+  retry_limit: 1
+  prefetch: 10
+  # declare exchange/queue/dlq on start; set false if topology is managed elsewhere
+  declare_topology: true
+
+admin:
+  host: "0.0.0.0"
+  port: 8888
+
+servers:
+  site_a:
+    host: ${RABBIT_HOST:-127.0.0.1}
+    port: ${RABBIT_PORT:-5672}
+    username: ${RABBIT_USER:-guest}
+    password: ${RABBIT_PASSWORD:-guest}
+    vhost: ${RABBIT_VHOST:-/}
+    reconnect_seconds: 30
+  # site_b:
+  #   host: ${RABBIT_HOST_B:-127.0.0.1}
+  #   port: 5672
+  #   username: ${RABBIT_USER:-guest}
+  #   password: ${RABBIT_PASSWORD:-guest}
+  #   vhost: /
+
+jobs:
+  # server 可写单个名，或列表（其它字段相同，按 server 各起一套消费者）
+  # server: site_a
+  # server: [site_a, site_b]
+  - name: text_mail
+    server: site_a
+    queue: text_mail
+    exchange: text_mail_router
+    type: direct
+    url: ${CONSUMER_URL:-http://127.0.0.1:8080/consumerDispatch/dispatch}
+    url_host: ${CONSUMER_HOST_HEADER:-}
+    timeout_ms: 20000
+    count: 2
+    retry_limit: 3
+    prefetch: 5
+    # block_patterns: "bad-payload"
+    # discard_match_jobs: true
+    # dlq: text_mail.dlq
+
+  - name: bounce_mail
+    server: site_a
+    # queue/exchange/url inherit conventions + defaults
