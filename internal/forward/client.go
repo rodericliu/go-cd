@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+const maxResponseBytes = 1 << 20
+
 // Client posts queue messages to HTTP consumers (legacy form contract).
 // Safe for concurrent use; create once and share.
 type Client struct {
@@ -22,14 +24,16 @@ func New(safetyTimeout time.Duration) *Client {
 	if safetyTimeout <= 0 {
 		safetyTimeout = 2 * time.Minute
 	}
+	// Start from the default transport to keep proxy support, dial/TLS
+	// timeouts and HTTP/2, then tune pooling.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConns = 100
+	tr.MaxIdleConnsPerHost = 25
+	tr.IdleConnTimeout = 90 * time.Second
 	return &Client{
 		http: &http.Client{
-			Timeout: safetyTimeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 25,
-				IdleConnTimeout:     90 * time.Second,
-			},
+			Timeout:   safetyTimeout,
+			Transport: tr,
 		},
 	}
 }
@@ -56,16 +60,15 @@ func (c *Client) Post(ctx context.Context, endpoint, hostHeader, queueName, body
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	if hostHeader != "" {
 		req.Host = hostHeader
-		req.Header.Set("Host", hostHeader)
 	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return Result{Body: err.Error(), Err: fmt.Errorf("http post: %w", err)}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return Result{StatusCode: resp.StatusCode, Body: err.Error(), Err: fmt.Errorf("read body: %w", err)}
 	}

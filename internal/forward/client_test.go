@@ -4,50 +4,75 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 )
 
-func TestPostSuccessOK(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Fatalf("method=%s", r.Method)
-		}
-		if r.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
-			t.Fatalf("ct=%s", r.Header.Get("Content-Type"))
-		}
-		body, _ := io.ReadAll(r.Body)
-		if string(body) != "queueName=mail&bodyData=hello" && string(body) != "bodyData=hello&queueName=mail" {
-			// url.Values.Encode is sorted by key: bodyData then queueName
-			if string(body) != "bodyData=hello&queueName=mail" {
-				t.Fatalf("body=%q", body)
-			}
-		}
-		if r.Host != "virtual.example" && r.Header.Get("Host") != "virtual.example" {
-			// httptest may not preserve Host the same way; check header set on request side via client
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(" ok \n"))
-	}))
-	defer srv.Close()
+type captured struct {
+	method, contentType, host string
+	form                      url.Values
+}
 
-	c := New(5 * time.Second)
-	res := c.Post(t.Context(), srv.URL, "virtual.example", "mail", "hello")
-	if !res.OK || res.Body != "ok" {
-		t.Fatalf("res=%+v", res)
+func TestPost(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   int
+		respBody string
+		host     string
+		wantOK   bool
+		wantBody string
+	}{
+		{name: "ok with whitespace", status: http.StatusOK, respBody: " ok \n", wantOK: true, wantBody: "ok"},
+		{name: "ok case insensitive", status: http.StatusOK, respBody: "OK", wantOK: true, wantBody: "OK"},
+		{name: "host header override", status: http.StatusOK, respBody: "ok", host: "virtual.example", wantOK: true, wantBody: "ok"},
+		{name: "200 but not ok", status: http.StatusOK, respBody: "error", wantOK: false, wantBody: "error"},
+		{name: "500", status: http.StatusInternalServerError, respBody: "boom", wantOK: false,
+			wantBody: "http code: 500\nstatus: 500 Internal Server Error\nboom"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Assertions run on the test goroutine; the handler only records.
+			got := make(chan captured, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(r.Body)
+				form, _ := url.ParseQuery(string(raw))
+				got <- captured{method: r.Method, contentType: r.Header.Get("Content-Type"), host: r.Host, form: form}
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, tt.respBody)
+			}))
+			t.Cleanup(srv.Close)
+
+			res := New(5*time.Second).Post(t.Context(), srv.URL, tt.host, "mail", "hello & bye")
+
+			if res.OK != tt.wantOK || res.Body != tt.wantBody || res.StatusCode != tt.status {
+				t.Fatalf("res = %+v, want ok=%v body=%q status=%d", res, tt.wantOK, tt.wantBody, tt.status)
+			}
+			req := <-got
+			if req.method != http.MethodPost {
+				t.Errorf("method = %s", req.method)
+			}
+			if req.contentType != "application/x-www-form-urlencoded" {
+				t.Errorf("content-type = %s", req.contentType)
+			}
+			if req.form.Get("queueName") != "mail" || req.form.Get("bodyData") != "hello & bye" {
+				t.Errorf("form = %v", req.form)
+			}
+			if tt.host != "" && req.host != tt.host {
+				t.Errorf("host = %q, want %q", req.host, tt.host)
+			}
+		})
 	}
 }
 
-func TestPostNonOK(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte("boom"))
-	}))
-	defer srv.Close()
+func TestPostTransportError(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	endpoint := srv.URL
+	srv.Close() // nothing listens any more
 
-	c := New(5 * time.Second)
-	res := c.Post(t.Context(), srv.URL, "", "q", "b")
-	if res.OK {
-		t.Fatal("expected failure")
+	res := New(time.Second).Post(t.Context(), endpoint, "", "q", "b")
+	if res.OK || res.Err == nil {
+		t.Fatalf("res = %+v, want transport error", res)
 	}
 }
