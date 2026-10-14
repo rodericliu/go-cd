@@ -165,7 +165,7 @@
 | F-10 | Admin API 鉴权（Token / mTLS） | P1 | 已完成：`admin.tokens`（Bearer）+ 可选 `admin.tls`（HTTPS / 客户端证书），仅保护 `/api/*`；写操作审计日志 |
 | F-11 | 下游熔断（连续失败暂停 job） | P1 | **不做**（决策）：重试耗尽的消息直接进 DLQ，可 replay |
 | F-12 | 失败日志可选记录 body（采样 / 截断） | P1 | 已完成：`log.failed_body`（默认关闭，`max_bytes` 截断、`sample_rate` 采样）；`log.level` 可配置 |
-| F-13 | 多副本协调 purge（原 ZK 主从诉求的现代替代） | P2 | 未开始 |
+| F-13 | 多副本协调 purge（原 ZK 主从诉求的现代替代） | P2 | **不做**（决策）：purge 需求很少；队列由 RabbitMQ 共享，任一副本 purge 即全局生效，缺的只是"先暂停所有副本"，用运维流程（缩容到 1 个副本或逐个 Pod 把 worker 设为 0）即可解决，不值得引入跨副本广播 / 确认的复杂度。操作流程见 README「清空队列（purge）」 |
 | F-14 | 配置热加载 | P2 | 已完成：`POST /api/reload`（支持 `dry_run`）与 SIGHUP；校验失败保持旧配置；按 job 增 / 删 / 更新 / 扩缩容 / 重建，Admin API 的临时修改仅在文件同一项变化时被覆盖；监听地址、TLS、日志输出需重启 |
 
 ---
@@ -228,7 +228,7 @@
 2. **失败进 DLQ 而非 Redis**：语义更清晰，可用 RabbitMQ 原生命令运维。  
 3. **Admin 用 HTTP 而非 JMX**：适配 K8s / curl / 网关。  
 4. **不在 struct 中长期存放 `context.Context`**：生命周期用 `chan struct{}`；请求级 context 临时派生。  
-5. **不做嵌入式 ZK 主从**：多副本依赖外部编排；purge 需运维知晓多副本影响。
+5. **不做嵌入式 ZK 主从，也不做跨副本协调**：多副本依赖外部编排；多副本下 purge 按 README 的运维流程操作（见 F-13）。
 
 ---
 
@@ -437,7 +437,7 @@ go-cd/
 | 风险 | 缓解 |
 |------|------|
 | Admin 未配置鉴权 | 已支持 Token / mTLS；未配置时启动打 Warn，仍建议配合内网 / NetworkPolicy |
-| 多副本同时 purge | 文档说明；或先缩容再 purge |
+| 多副本下 purge 时其他副本仍在消费 | 按 README「清空队列（purge）」流程：先缩容到 1 个副本，或逐个 Pod 把 worker 设为 0，再 purge（F-13 决策不做自动协调） |
 | 成功日志量过大 | 成功日志已降为 Debug；`log.level` 可调 |
 | `declare_topology` 与现网拓扑冲突 | 支持关闭声明，改用 passive |
 | 同名 job 不同 URL | 不合并；逻辑名带 server 后缀 |

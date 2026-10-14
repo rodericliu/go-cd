@@ -117,6 +117,79 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" localhost:8888/api/jobs
 
 通过 Admin API 做的修改只保存在内存里，重启后恢复为配置文件的值。
 
+### 清空队列（purge）
+
+`purge` 会删除队列里所有**等待中**的消息，**不可恢复**。
+
+- 队列在 RabbitMQ 上由所有副本共享，所以在任意一个副本上 purge 都对整个队列生效。
+- 已经被 worker 取走、还没 ack 的消息不受影响，会照常处理完。
+- 如果只是想清掉某一类脏数据，优先用 `block-patterns` 加 `discard-match` 精确丢弃，不用清空整个队列。
+
+关键是 **purge 之前先让所有副本停止消费这个 job**，否则其他副本在 purge 前后还会继续投递消息。`/workers` 只对收到请求的那个副本生效，所以多副本部署时要按下面的方法操作（程序不提供自动的跨副本协调，原因见 PRD F-13）。
+
+下面的 `JOB` 要写逻辑名（`name-server`）。多 server 的 job 对应不同 server 上的不同队列，每个逻辑名要分别操作。
+
+```bash
+JOB=tnc_forum_post_dfv2-n
+API=localhost:8888/api/jobs/$JOB
+AUTH="Authorization: Bearer $ADMIN_TOKEN"
+```
+
+#### 单副本
+
+```bash
+# 1. 确认要清的是哪些消息，并记下当前 worker 数（返回结果里的 "workers"）
+curl -s -H "$AUTH" "$API/peek?count=5"
+curl -s -H "$AUTH" "$API"
+
+# 2. 暂停消费：worker 设为 0（每个 worker 会先处理完手上那条消息）
+curl -s -XPOST -H "$AUTH" -d '{"count":0}' "$API/workers"
+
+# 3. 确认已暂停："workers" 为 0
+curl -s -H "$AUTH" "$API"
+
+# 4. 清空队列，返回 {"purged":N}
+curl -s -XPOST -H "$AUTH" "$API/purge"
+
+# 5. 恢复消费：改回第 1 步记下的 worker 数
+curl -s -XPOST -H "$AUTH" -d '{"count":2}' "$API/workers"
+```
+
+#### 多副本
+
+可以任选下面一种方法：
+
+**方法一：先缩容到 1 个副本**（最简单，但缩容期间其他 job 的消费能力会下降）
+
+```bash
+kubectl scale deployment/consumer-dispatcher --replicas=1
+kubectl get pods -l app=consumer-dispatcher   # 等多余的 Pod 完全退出（优雅停机最多 15 秒）
+# 按「单副本」的步骤 1–5 操作
+kubectl scale deployment/consumer-dispatcher --replicas=<原副本数>
+```
+
+**方法二：逐个 Pod 把 worker 设为 0**（不影响其他 job）
+
+```bash
+PODS=$(kubectl get pods -l app=consumer-dispatcher -o name)
+post() { kubectl exec "$1" -- wget -qO- --header "$AUTH" --post-data "$2" "http://127.0.0.1:8888/api/jobs/$JOB/$3"; }
+
+# 暂停所有 Pod
+for p in $PODS; do post "$p" '{"count":0}' workers; echo " <- $p"; done
+
+# 在任意一个 Pod 上 purge 一次即可
+post "$(echo "$PODS" | head -1)" '{}' purge
+
+# 恢复所有 Pod（改成原来的 worker 数）
+for p in $PODS; do post "$p" '{"count":2}' workers; echo " <- $p"; done
+```
+
+注意：
+
+- `app=consumer-dispatcher`、`deployment/consumer-dispatcher` 换成实际的 label 和 Deployment 名。镜像基于 alpine，自带 `wget`；如果启用了 Admin TLS，地址要改成 `https://`。
+- 如果操作期间有 Pod 重启或新扩出来，它会按配置文件里的 `count` 重新开始消费。purge 前再确认一遍所有 Pod 的 `workers` 都是 0。
+- 不用 K8s 部署时也一样：对每个实例的 Admin 地址分别调用 `/workers`。
+
 ### 配置热加载
 
 修改配置文件后，不用重启就能生效：
