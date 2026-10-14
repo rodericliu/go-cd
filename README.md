@@ -44,6 +44,8 @@ go run ./cmd/xml2yaml -in ../job.xml -out configs/config.yaml -merge=false
 
 同名且除 `server` 外配置相同的 job 会合并为 `server: [a, b, ...]`。
 
+job.xml 里没有鉴权和日志配置，生成的 YAML 会按示例配置补上 `admin.tokens: ["${ADMIN_TOKEN:-}"]` 和 `log`（`level: ${LOG_LEVEL:-info}`，失败 body 默认不记录）。上线前设置 `ADMIN_TOKEN`；需要 HTTPS / mTLS 时手动加 `admin.tls`。
+
 ## 配置
 
 - YAML：`configs/config.example.yaml`

@@ -79,6 +79,7 @@ type jobXML struct {
 type yamlFile struct {
 	Defaults defaultsYAML          `yaml:"defaults"`
 	Admin    adminYAML             `yaml:"admin"`
+	Log      logYAML               `yaml:"log"`
 	Servers  map[string]serverYAML `yaml:"servers"`
 	Jobs     []jobYAML             `yaml:"jobs"`
 }
@@ -93,9 +94,28 @@ type defaultsYAML struct {
 }
 
 type adminYAML struct {
-	Host string `yaml:"host"`
-	Port int    `yaml:"port"`
+	Host   string   `yaml:"host"`
+	Port   int      `yaml:"port"`
+	Tokens []string `yaml:"tokens"`
 }
+
+type logYAML struct {
+	Level      string         `yaml:"level"`
+	FailedBody failedBodyYAML `yaml:"failed_body"`
+}
+
+type failedBodyYAML struct {
+	Enabled    bool    `yaml:"enabled"`
+	MaxBytes   int     `yaml:"max_bytes"`
+	SampleRate float64 `yaml:"sample_rate"`
+}
+
+// job.xml has no admin auth or log settings; these placeholders match
+// configs/config.example.yaml so the secret and level come from the environment.
+const (
+	adminTokenPlaceholder = "${ADMIN_TOKEN:-}"
+	logLevelPlaceholder   = "${LOG_LEVEL:-info}"
+)
 
 type serverYAML struct {
 	Host             string `yaml:"host"`
@@ -177,7 +197,9 @@ func normalizeXML(raw []byte) []byte {
 }
 
 func toYAML(doc jobsXML, opt Options) (yamlFile, []string) {
-	var notes []string
+	notes := []string{
+		"set ADMIN_TOKEN (>= 16 chars) to protect /api/*; without it the admin API is unauthenticated. For HTTPS/mTLS add admin.tls (see configs/config.example.yaml)",
+	}
 	out := yamlFile{
 		Defaults: defaultsYAML{
 			URL:             strings.TrimSpace(doc.Conf.RequestPre),
@@ -188,8 +210,13 @@ func toYAML(doc jobsXML, opt Options) (yamlFile, []string) {
 			DeclareTopology: true,
 		},
 		Admin: adminYAML{
-			Host: firstNonEmpty(strings.TrimSpace(doc.Monitor.HTTPHost), "0.0.0.0"),
-			Port: doc.Monitor.HTTPPort,
+			Host:   firstNonEmpty(strings.TrimSpace(doc.Monitor.HTTPHost), "0.0.0.0"),
+			Port:   doc.Monitor.HTTPPort,
+			Tokens: []string{adminTokenPlaceholder},
+		},
+		Log: logYAML{
+			Level:      logLevelPlaceholder,
+			FailedBody: failedBodyYAML{MaxBytes: 512, SampleRate: 1},
 		},
 		Servers: make(map[string]serverYAML, len(doc.Servers.QueueServers)),
 	}

@@ -81,6 +81,54 @@ func TestConvertBasicAndMerge(t *testing.T) {
 	}
 }
 
+func TestConvertAdminAndLogSettings(t *testing.T) {
+	xml := `
+<jobs>
+  <conf><request-pre>http://x</request-pre></conf>
+  <monitor httpHost="0.0.0.0" httpPort="9"/>
+  <servers>
+    <queueserver name="a" host="h" port="5672" userName="u" password="p" vhost="/"/>
+  </servers>
+  <job name="only" server="a"/>
+</jobs>`
+	out, err := Convert([]byte(xml), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "ADMIN_TOKEN") {
+		t.Fatalf("admin token note/placeholder missing:\n%s", out)
+	}
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("env unset", func(t *testing.T) {
+		t.Setenv("ADMIN_TOKEN", "")
+		t.Setenv("LOG_LEVEL", "")
+		cfg, _, err := config.Load(path)
+		if err != nil {
+			t.Fatalf("load: %v\n%s", err, out)
+		}
+		fb := cfg.Log.FailedBody
+		if len(cfg.Admin.Tokens) != 0 || cfg.Log.Level != "info" || fb.Enabled || fb.MaxBytes != 512 || fb.Rate() != 1 {
+			t.Fatalf("admin=%+v log=%+v", cfg.Admin, cfg.Log)
+		}
+	})
+
+	t.Run("env set", func(t *testing.T) {
+		t.Setenv("ADMIN_TOKEN", "0123456789abcdef")
+		t.Setenv("LOG_LEVEL", "debug")
+		cfg, _, err := config.Load(path)
+		if err != nil {
+			t.Fatalf("load: %v\n%s", err, out)
+		}
+		if len(cfg.Admin.Tokens) != 1 || cfg.Admin.Tokens[0] != "0123456789abcdef" || cfg.Log.Level != "debug" {
+			t.Fatalf("admin=%+v log=%+v", cfg.Admin, cfg.Log)
+		}
+	})
+}
+
 func TestConvertSingleServerString(t *testing.T) {
 	xml := `
 <jobs>
