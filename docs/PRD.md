@@ -160,11 +160,11 @@
 
 ### 5.8 后续（P1 / 非本版必达）
 
-| ID | 需求 | 优先级 |
-|----|------|--------|
-| F-10 | Admin API 鉴权（Token / mTLS） | P1 |
-| F-11 | 下游熔断（连续失败暂停 job） | P1 |
-| F-12 | 失败日志可选记录 body（采样 / 截断） | P1 |
+| ID | 需求 | 优先级 | 状态 |
+|----|------|--------|------|
+| F-10 | Admin API 鉴权（Token / mTLS） | P1 | 已完成：`admin.tokens`（Bearer）+ 可选 `admin.tls`（HTTPS / 客户端证书），仅保护 `/api/*`；写操作审计日志 |
+| F-11 | 下游熔断（连续失败暂停 job） | P1 | **不做**（决策）：重试耗尽的消息直接进 DLQ，可 replay |
+| F-12 | 失败日志可选记录 body（采样 / 截断） | P1 | 已完成：`log.failed_body`（默认关闭，`max_bytes` 截断、`sample_rate` 采样）；`log.level` 可配置 |
 | F-13 | 多副本协调 purge（原 ZK 主从诉求的现代替代） | P2 |
 | F-14 | 配置热加载 | P2 |
 
@@ -176,7 +176,7 @@
 |------|------|
 | 性能 | 定位为 I/O 密集薄代理；瓶颈应在 HTTP 消费者或 MQ，而非 dispatcher 本身 |
 | 资源 | 共享连接 + 共享 HTTP client，控制 FD 与内存 |
-| 安全 | 密码走环境变量 / Secret；生产 Admin 应网络隔离（鉴权为 P1） |
+| 安全 | 密码与 Admin token 走环境变量 / Secret；生产环境应配置 `admin.tokens`（可加 mTLS），并做网络隔离 |
 | 兼容 | HTTP 契约与旧版一致；拓扑约定兼容 |
 | 可维护 | 模块边界清晰；遵循 go-guidelines（Go 1.27） |
 | 部署 | 单二进制；提供 Dockerfile |
@@ -290,9 +290,10 @@
 ### 8.4 日志
 
 - 格式：JSON，stdout  
-- 级别：默认 Info  
+- 级别：默认 Info，`log.level` 可配置（debug / info / warn / error）  
 - 消费成功：`forward ok`（Debug 级别，含 job、attempt、result）  
-- 失败：`forward failed`（含 result/err；**默认不打印完整 body**）  
+- 失败：每次尝试打 `forward failed`（含 result/err），进入 DLQ 打 `message dead-lettered`；**默认不打印 body**，`log.failed_body` 开启后附带截断、采样后的 body  
+- 审计：`/api/*` 写操作打 `admin api`（method、path、status、identity、remote），鉴权失败打 `admin auth failed`；token 不写入日志  
 - 与旧版差异：不再按 server 写滚动文件；坏任务以 DLQ 为主
 
 ---
@@ -303,7 +304,8 @@
 
 ```yaml
 defaults: { url, url_host, count, timeout_ms, encoding, retry_limit, prefetch, declare_topology }
-admin:    { host, port }
+admin:    { host, port, tokens, tls: { cert_file, key_file, client_ca_file } }
+log:      { level, failed_body: { enabled, max_bytes, sample_rate } }
 servers:  { <name>: { host, port, username, password, vhost, reconnect_seconds } }
 jobs:     [ { name, server, queue, exchange, ... } ]
 ```
@@ -433,9 +435,9 @@ go-cd/
 
 | 风险 | 缓解 |
 |------|------|
-| Admin 无鉴权 | 内网 / NetworkPolicy；P1 加 Token |
+| Admin 未配置鉴权 | 已支持 Token / mTLS；未配置时启动打 Warn，仍建议配合内网 / NetworkPolicy |
 | 多副本同时 purge | 文档说明；或先缩容再 purge |
-| 成功日志量过大 | 后续可降采样 / 调日志级别 |
+| 成功日志量过大 | 成功日志已降为 Debug；`log.level` 可调 |
 | `declare_topology` 与现网拓扑冲突 | 支持关闭声明，改用 passive |
 | 同名 job 不同 URL | 不合并；逻辑名带 server 后缀 |
 
@@ -449,7 +451,7 @@ go-cd/
 | M2 | Hub 连接复用、共享 HTTP、优雅停机、DLQ | 已完成 |
 | M3 | Admin API、metrics、探针 | 已完成 |
 | M4 | 多 server 列表、xml2yaml、目录独立 go-cd | 已完成 |
-| M5 | Admin 鉴权、熔断、日志策略增强 | 未开始（P1） |
+| M5 | Admin 鉴权、熔断、日志策略增强 | 已完成（熔断按决策不做） |
 
 ---
 

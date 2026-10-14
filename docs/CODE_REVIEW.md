@@ -202,8 +202,8 @@ go test -tags=integration ./internal/broker/ ./internal/worker/
 | RabbitMQ 4.x 禁止"非持久化且非独占"的队列 | 集成测试时发现：配置 `queue_durable: false` 的 job 在 4.x 上声明队列会失败；从旧版 Java 迁移过来的 `queueDurable="false"` 也一样 | 在配置校验阶段给出提示，或者在迁移文档里注明 |
 | 拨号不能被中断 | amqp091 的拨号不支持 ctx，worker 卡在拨号时，强制中断最多要等 10 秒的拨号超时 | 先接受；需要的话改成自定义 `Dial` 函数 |
 | `encoding` 字段没有用到 | 表单固定按 UTF-8 编码。旧版如果有非 UTF-8 的 consumer，行为会不一致 | 确认是否还有非 UTF-8 的 consumer |
-| Admin 没有鉴权 | PRD 里列为 P1（F-10） | 上线前至少做网络隔离，之后加 Token |
-| DLQ 持续写入失败时会循环 | 消息被 nack 放回后马上又被投递，会反复重试（HTTP 重试本身带退避） | 观察 `outcome=failed` 指标，需要时加熔断 |
+| ~~Admin 没有鉴权~~ | **已在 M5 实现**：Bearer Token 加可选 mTLS，写操作有审计日志（见 PRD F-10） | 生产环境配置 `admin.tokens` |
+| DLQ 持续写入失败时会循环 | 消息被 nack 放回后马上又被投递，会反复重试（HTTP 重试本身带退避）。按决策不做熔断（F-11） | 观察 `outcome=failed` 指标 |
 | manager 覆盖率偏低（43%） | purge、peek、replay 的成功路径要靠真实 MQ，目前只有端到端验证覆盖 | 补充 manager 的集成测试 |
 
 ---

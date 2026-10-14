@@ -50,6 +50,7 @@ go run ./cmd/xml2yaml -in ../job.xml -out configs/config.yaml -merge=false
 - 支持 `${VAR}`、`${VAR:-default}` 展开（解析 YAML 后按字面替换标量值；裸 `$` 不展开；flow 风格 `{...}` / `[...]` 里需写成 `"${VAR}"`）
 - 密码等密钥放环境变量 / Secret，不要写进仓库
 - `retry_limit: 0` 表示不重试，`count: 0` 表示启动时不起 worker
+- 日志：`log.level` 设置级别（debug/info/warn/error）。消息进 DLQ 时会打 `message dead-lettered`；`log.failed_body.enabled: true` 时，这条日志会附带 body（按 `max_bytes` 截断，按 `sample_rate` 采样）。默认不记录，因为 body 可能含敏感数据
 
 约定（与旧版一致）：
 
@@ -75,6 +76,19 @@ HTTP 表单字段：`queueName`（job name）、`bodyData`（消息体）。
 ## Admin API
 
 默认监听 `admin.host:admin.port`（示例 `0.0.0.0:8888`）。
+
+### 鉴权
+
+`/api/*` 受保护；`/healthz`、`/readyz`、`/metrics` 始终免鉴权（给探针和 Prometheus 用）。
+
+- **Bearer Token**：配置 `admin.tokens`（建议写 `${ADMIN_TOKEN}`，每个至少 16 个字符），请求时带 `Authorization: Bearer <token>`。可以配置多个，方便轮换。
+- **mTLS（可选）**：配置 `admin.tls.cert_file` / `key_file` 启用 HTTPS；再配置 `client_ca_file` 后，`/api/*` 必须携带该 CA 签发的客户端证书。探针不带证书也能访问。
+- 两者同时配置时，两个条件都要满足。都没配置时 `/api/*` 不鉴权，启动时打 Warn。
+- 写操作（非 GET）都会记录审计日志 `admin api`，包括 method、path、status、identity（`token#N` 或 `cert:<CN>`）、remote；GET 请求在 debug 级别记录。token 本身不会写进日志。
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" localhost:8888/api/jobs
+```
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
