@@ -15,6 +15,10 @@ const (
 
 	defaultFailedBodyMaxBytes = 512
 	maxFailedBodyMaxBytes     = 64 << 10
+
+	defaultLogMaxSizeMB  = 100
+	defaultLogMaxBackups = 10
+	defaultLogMaxAgeDays = 30
 )
 
 // Admin configures the admin HTTP server.
@@ -79,9 +83,32 @@ func (a *Admin) normalize() error {
 // Log configures logging.
 type Log struct {
 	// Level is one of debug, info, warn, error (default info).
-	Level      string     `yaml:"level"`
+	Level string  `yaml:"level"`
+	File  LogFile `yaml:"file"`
+	// Stdout also writes logs to stdout when File.Path is set (default false).
+	// Without a file, logs always go to stdout.
+	Stdout     bool       `yaml:"stdout"`
 	FailedBody FailedBody `yaml:"failed_body"`
 }
+
+// LogFile writes logs to a size-rotated file.
+type LogFile struct {
+	// Path of the log file; empty logs to stdout only.
+	Path string `yaml:"path"`
+	// MaxSizeMB rotates the file once it reaches this size (default 100).
+	MaxSizeMB int `yaml:"max_size_mb"`
+	// MaxBackups is the number of rotated files to keep; 0 keeps all (default 10).
+	MaxBackups *int `yaml:"max_backups"`
+	// MaxAgeDays removes rotated files older than this; 0 disables (default 30).
+	MaxAgeDays *int `yaml:"max_age_days"`
+	// Compress gzips rotated files (default true).
+	Compress *bool `yaml:"compress"`
+	// LocalTime names rotated files using local time instead of UTC (default false).
+	LocalTime bool `yaml:"local_time"`
+}
+
+// Enabled reports whether logs are written to a file.
+func (f LogFile) Enabled() bool { return f.Path != "" }
 
 // FailedBody controls whether the body of a dead-lettered message is logged.
 // Bodies may contain sensitive data, so this is off by default.
@@ -117,6 +144,10 @@ func (l *Log) normalize() error {
 		return fmt.Errorf("log.level %q: want debug, info, warn or error", l.Level)
 	}
 
+	if err := l.File.normalize(); err != nil {
+		return err
+	}
+
 	fb := &l.FailedBody
 	if fb.MaxBytes == 0 {
 		fb.MaxBytes = defaultFailedBodyMaxBytes
@@ -126,6 +157,31 @@ func (l *Log) normalize() error {
 	}
 	if r := fb.Rate(); r <= 0 || r > 1 {
 		return errors.New("log.failed_body.sample_rate must be in (0, 1]")
+	}
+	return nil
+}
+
+func (f *LogFile) normalize() error {
+	f.Path = strings.TrimSpace(f.Path)
+	if f.MaxSizeMB == 0 {
+		f.MaxSizeMB = defaultLogMaxSizeMB
+	}
+	if f.MaxBackups == nil {
+		f.MaxBackups = new(defaultLogMaxBackups)
+	}
+	if f.MaxAgeDays == nil {
+		f.MaxAgeDays = new(defaultLogMaxAgeDays)
+	}
+	if f.Compress == nil {
+		f.Compress = new(true)
+	}
+	switch {
+	case f.MaxSizeMB < 0:
+		return errors.New("log.file.max_size_mb must be positive")
+	case *f.MaxBackups < 0:
+		return errors.New("log.file.max_backups must be >= 0")
+	case *f.MaxAgeDays < 0:
+		return errors.New("log.file.max_age_days must be >= 0")
 	}
 	return nil
 }

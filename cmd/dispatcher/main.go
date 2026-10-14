@@ -15,6 +15,7 @@ import (
 
 	"consumer-dispatcher/internal/admin"
 	"consumer-dispatcher/internal/config"
+	"consumer-dispatcher/internal/logging"
 	"consumer-dispatcher/internal/manager"
 )
 
@@ -34,10 +35,15 @@ func run() int {
 		newLogger(slog.LevelInfo).Error("load config", "err", err)
 		return 1
 	}
-	log := newLogger(cfg.Log.SlogLevel())
+	log, closeLog, err := logging.New(cfg.Log, os.Stdout)
+	if err != nil {
+		newLogger(slog.LevelInfo).Error("open log", "err", err)
+		return 1
+	}
+	defer func() { _ = closeLog() }()
 	slog.SetDefault(log)
 	log.Info("config loaded", "jobs", len(jobs), "servers", len(cfg.Servers), "admin", cfg.Admin.Addr(),
-		"log_level", cfg.Log.Level, "log_failed_body", cfg.Log.FailedBody.Enabled)
+		"log_level", cfg.Log.Level, "log_file", cfg.Log.File.Path, "log_failed_body", cfg.Log.FailedBody.Enabled)
 
 	var tlsCfg *tls.Config
 	if cfg.Admin.TLS.Enabled() {

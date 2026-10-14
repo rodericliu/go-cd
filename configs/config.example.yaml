@@ -28,6 +28,15 @@ admin:
 
 log:
   level: ${LOG_LEVEL:-info}   # debug | info | warn | error
+  # 日志文件；path 为空时只输出到终端（stdout）。按大小自动切割。
+  file:
+    path: ${LOG_FILE:-}        # 例如 /var/log/consumer-dispatcher/dispatcher.log
+    max_size_mb: 100           # 单个文件达到该大小后切割
+    max_backups: 10            # 保留的旧文件个数，0 表示不限
+    max_age_days: 30           # 旧文件保留天数，0 表示不限
+    compress: true             # 旧文件 gzip 压缩
+  # 配置了 file.path 时是否同时输出到终端（容器里可打开，方便 kubectl logs）
+  stdout: false
   # 消息进入 DLQ 时是否在日志中记录 body（可能含敏感数据，默认关闭）
   failed_body:
     enabled: false

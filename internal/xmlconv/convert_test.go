@@ -106,6 +106,7 @@ func TestConvertAdminAndLogSettings(t *testing.T) {
 	t.Run("env unset", func(t *testing.T) {
 		t.Setenv("ADMIN_TOKEN", "")
 		t.Setenv("LOG_LEVEL", "")
+		t.Setenv("LOG_FILE", "")
 		cfg, _, err := config.Load(path)
 		if err != nil {
 			t.Fatalf("load: %v\n%s", err, out)
@@ -114,16 +115,21 @@ func TestConvertAdminAndLogSettings(t *testing.T) {
 		if len(cfg.Admin.Tokens) != 0 || cfg.Log.Level != "info" || fb.Enabled || fb.MaxBytes != 512 || fb.Rate() != 1 {
 			t.Fatalf("admin=%+v log=%+v", cfg.Admin, cfg.Log)
 		}
+		if cfg.Log.File.Enabled() || cfg.Log.Stdout {
+			t.Fatalf("log file should be off without LOG_FILE: %+v", cfg.Log)
+		}
 	})
 
 	t.Run("env set", func(t *testing.T) {
 		t.Setenv("ADMIN_TOKEN", "0123456789abcdef")
 		t.Setenv("LOG_LEVEL", "debug")
+		t.Setenv("LOG_FILE", "/var/log/cd.log")
 		cfg, _, err := config.Load(path)
 		if err != nil {
 			t.Fatalf("load: %v\n%s", err, out)
 		}
-		if len(cfg.Admin.Tokens) != 1 || cfg.Admin.Tokens[0] != "0123456789abcdef" || cfg.Log.Level != "debug" {
+		if len(cfg.Admin.Tokens) != 1 || cfg.Admin.Tokens[0] != "0123456789abcdef" || cfg.Log.Level != "debug" ||
+			cfg.Log.File.Path != "/var/log/cd.log" {
 			t.Fatalf("admin=%+v log=%+v", cfg.Admin, cfg.Log)
 		}
 	})

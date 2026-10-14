@@ -101,7 +101,17 @@ type adminYAML struct {
 
 type logYAML struct {
 	Level      string         `yaml:"level"`
+	File       logFileYAML    `yaml:"file"`
+	Stdout     bool           `yaml:"stdout"`
 	FailedBody failedBodyYAML `yaml:"failed_body"`
+}
+
+type logFileYAML struct {
+	Path       string `yaml:"path"`
+	MaxSizeMB  int    `yaml:"max_size_mb"`
+	MaxBackups int    `yaml:"max_backups"`
+	MaxAgeDays int    `yaml:"max_age_days"`
+	Compress   bool   `yaml:"compress"`
 }
 
 type failedBodyYAML struct {
@@ -115,6 +125,7 @@ type failedBodyYAML struct {
 const (
 	adminTokenPlaceholder = "${ADMIN_TOKEN:-}"
 	logLevelPlaceholder   = "${LOG_LEVEL:-info}"
+	logFilePlaceholder    = "${LOG_FILE:-}"
 )
 
 type serverYAML struct {
@@ -215,7 +226,10 @@ func toYAML(doc jobsXML, opt Options) (yamlFile, []string) {
 			Tokens: []string{adminTokenPlaceholder},
 		},
 		Log: logYAML{
-			Level:      logLevelPlaceholder,
+			Level: logLevelPlaceholder,
+			File: logFileYAML{
+				Path: logFilePlaceholder, MaxSizeMB: 100, MaxBackups: 10, MaxAgeDays: 30, Compress: true,
+			},
 			FailedBody: failedBodyYAML{MaxBytes: 512, SampleRate: 1},
 		},
 		Servers: make(map[string]serverYAML, len(doc.Servers.QueueServers)),

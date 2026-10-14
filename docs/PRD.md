@@ -289,7 +289,7 @@
 
 ### 8.4 日志
 
-- 格式：JSON，stdout  
+- 格式：JSON；默认 stdout，配置 `log.file.path` 后写入文件（按大小切割、保留个数 / 天数、gzip 压缩），`log.stdout` 控制是否同时输出到终端  
 - 级别：默认 Info，`log.level` 可配置（debug / info / warn / error）  
 - 消费成功：`forward ok`（Debug 级别，含 job、attempt、result）  
 - 失败：每次尝试打 `forward failed`（含 result/err），进入 DLQ 打 `message dead-lettered`；**默认不打印 body**，`log.failed_body` 开启后附带截断、采样后的 body  
@@ -305,7 +305,7 @@
 ```yaml
 defaults: { url, url_host, count, timeout_ms, encoding, retry_limit, prefetch, declare_topology }
 admin:    { host, port, tokens, tls: { cert_file, key_file, client_ca_file } }
-log:      { level, failed_body: { enabled, max_bytes, sample_rate } }
+log:      { level, file: { path, max_size_mb, max_backups, max_age_days, compress, local_time }, stdout, failed_body: { enabled, max_bytes, sample_rate } }
 servers:  { <name>: { host, port, username, password, vhost, reconnect_seconds } }
 jobs:     [ { name, server, queue, exchange, ... } ]
 ```

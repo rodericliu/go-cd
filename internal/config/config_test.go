@@ -247,6 +247,26 @@ func TestAdminAndLogDefaults(t *testing.T) {
 	if cfg.Log.Level != "info" || fb.Enabled || fb.MaxBytes != 512 || fb.Rate() != 1 {
 		t.Fatalf("log defaults: %+v", cfg.Log)
 	}
+	f := cfg.Log.File
+	if f.Enabled() || cfg.Log.Stdout || f.MaxSizeMB != 100 || *f.MaxBackups != 10 || *f.MaxAgeDays != 30 || !*f.Compress {
+		t.Fatalf("log file defaults: %+v", f)
+	}
+}
+
+func TestLogFileSettings(t *testing.T) {
+	t.Setenv("LOG_FILE", "/var/log/cd/cd.log")
+	cfg, _, err := Load(writeConfig(t, `
+log:
+  stdout: true
+  file: {path: "${LOG_FILE}", max_size_mb: 50, max_backups: 0, max_age_days: 0, compress: false}
+`+minimalServersAndJobs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := cfg.Log.File
+	if f.Path != "/var/log/cd/cd.log" || !cfg.Log.Stdout || f.MaxSizeMB != 50 || *f.MaxBackups != 0 || *f.MaxAgeDays != 0 || *f.Compress {
+		t.Fatalf("log file: %+v stdout=%v (explicit zeros must be kept)", f, cfg.Log.Stdout)
+	}
 }
 
 func TestAdminTokensFromEnv(t *testing.T) {
@@ -282,6 +302,9 @@ func TestAdminAndLogValidation(t *testing.T) {
 		{name: "max_bytes too large", section: "log: {failed_body: {max_bytes: 1000000}}", wantErr: "max_bytes"},
 		{name: "sample_rate zero", section: "log: {failed_body: {sample_rate: 0}}", wantErr: "sample_rate"},
 		{name: "sample_rate above one", section: "log: {failed_body: {sample_rate: 1.5}}", wantErr: "sample_rate"},
+		{name: "negative max_size_mb", section: "log: {file: {path: a.log, max_size_mb: -1}}", wantErr: "max_size_mb"},
+		{name: "negative max_backups", section: "log: {file: {path: a.log, max_backups: -1}}", wantErr: "max_backups"},
+		{name: "negative max_age_days", section: "log: {file: {path: a.log, max_age_days: -1}}", wantErr: "max_age_days"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
