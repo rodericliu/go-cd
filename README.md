@@ -47,8 +47,9 @@ go run ./cmd/xml2yaml -in ../job.xml -out configs/config.yaml -merge=false
 ## 配置
 
 - YAML：`configs/config.example.yaml`
-- 支持 `${VAR}`、`${VAR:-default}` 展开
+- 支持 `${VAR}`、`${VAR:-default}` 展开（解析 YAML 后按字面替换标量值；裸 `$` 不展开；flow 风格 `{...}` / `[...]` 里需写成 `"${VAR}"`）
 - 密码等密钥放环境变量 / Secret，不要写进仓库
+- `retry_limit: 0` 表示不重试，`count: 0` 表示启动时不起 worker
 
 约定（与旧版一致）：
 
@@ -69,7 +70,7 @@ go run ./cmd/xml2yaml -in ../job.xml -out configs/config.yaml -merge=false
 
 HTTP 表单字段：`queueName`（job name）、`bodyData`（消息体）。
 
-失败重试耗尽后写入 DLQ，再 ack 原消息（不再用 Redis 存失败任务）。
+失败重试耗尽后写入 DLQ（publisher confirm 确认后），再 ack 原消息（不再用 Redis 存失败任务）。停机时先等处理中的消息完成；超过 15s 则中断并放回原队列，不会进 DLQ。
 
 ## Admin API
 
@@ -81,8 +82,8 @@ HTTP 表单字段：`queueName`（job name）、`bodyData`（消息体）。
 | GET | `/readyz` | 就绪探针（含 AMQP ping） |
 | GET | `/metrics` | Prometheus |
 | GET | `/api/jobs` | 任务列表 |
-| GET | `/api/jobs/{id}` | 任务详情（`name` 或 `name-server`） |
-| POST | `/api/jobs/{id}/workers` | `{"count":N}` 扩缩容 |
+| GET | `/api/jobs/{id}` | 任务详情（`name-server`；job 只绑定一个 server 时也可用 `name`） |
+| POST | `/api/jobs/{id}/workers` | `{"count":N}` 扩缩容（0–256） |
 | POST | `/api/jobs/{id}/url` | `{"url":"..."}` |
 | POST | `/api/jobs/{id}/block-patterns` | `{"patterns":"..."}` |
 | POST | `/api/jobs/{id}/discard-match` | `{"discard":true}` |
@@ -90,12 +91,18 @@ HTTP 表单字段：`queueName`（job name）、`bodyData`（消息体）。
 | POST | `/api/jobs/{id}/purge` | 清空主队列 |
 | POST | `/api/jobs/{id}/purge-dlq` | 清空 DLQ |
 | GET | `/api/jobs/{id}/peek?count=10` | 窥视（不 ack） |
-| GET | `/api/jobs/{id}/take?count=10` | 取出（ack） |
+| POST | `/api/jobs/{id}/take?count=10` | 取出（ack） |
 | GET | `/api/jobs/{id}/dlq?count=10` | 窥视 DLQ |
 | POST | `/api/jobs/{id}/replay-dlq` | `{"count":10}` 重放到主队列 |
+
+`count` 取值 1–100，缺省 10。`{id}` 用多 server job 的裸 `name` 时返回 **409**，需改用 `name-server`。其他错误：404 不存在、400 参数非法、413 请求体超过 1 MiB。
 
 ## 测试
 
 ```bash
-go test ./...
+go test -race ./...
+golangci-lint run ./...
+
+# 需要 RabbitMQ（默认 guest@127.0.0.1:5672，可用 RABBIT_HOST 等变量覆盖）
+go test -tags=integration ./internal/broker/ ./internal/worker/
 ```

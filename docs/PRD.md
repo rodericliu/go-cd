@@ -96,14 +96,14 @@
 | ID | 需求 | 验收 |
 |----|------|------|
 | F-01 | 按配置连接 RabbitMQ，对每个 resolved job 启动 N 个 worker | worker 数 = `count` |
-| F-02 | `basicConsume`，手动 ack | 成功或入 DLQ 后 ack；DLQ 发布失败则 nack+requeue |
+| F-02 | `basicConsume`，手动 ack | 成功或入 DLQ 后 ack；DLQ 发布失败则 nack+requeue；停机中断的消息 nack+requeue（不进 DLQ） |
 | F-03 | HTTP POST `application/x-www-form-urlencoded`：`queueName`=job name，`bodyData`=消息体 | 与旧版一致 |
 | F-04 | 可选 `Host` / `url_host` | 请求 Host 头可指定 |
 | F-05 | 成功条件：HTTP 200 且 body trim 后大小写不敏感等于 `ok` | 单测覆盖 |
-| F-06 | 失败重试：首次失败后再重试 `retry_limit` 次；指数退避 + jitter | 日志可见 attempt |
-| F-07 | 重试耗尽写入 DLQ（默认 `{queue}.dlq`），再 ack 原消息 | DLQ 可 peek/replay |
+| F-06 | 失败重试：首次失败后再重试 `retry_limit` 次（`0` = 不重试）；指数退避 + jitter | 日志可见 attempt |
+| F-07 | 重试耗尽写入 DLQ（默认 `{queue}.dlq`），broker 确认（publisher confirm + mandatory）后再 ack 原消息 | DLQ 可 peek/replay |
 | F-08 | `block_patterns` 正则匹配；`discard_match_jobs=true` 时直接 ack 丢弃 | 可 Admin 动态改 |
-| F-09 | 默认声明 exchange / queue / bind / DLQ；可 `declare_topology: false` | passive 校验主队列 |
+| F-09 | 默认声明 exchange / queue / bind / DLQ；可 `declare_topology: false` | passive 校验主队列与 DLQ |
 
 ### 5.2 配置（P0）
 
@@ -145,8 +145,8 @@
 | ID | 需求 |
 |----|------|
 | L-01 | 响应 SIGINT/SIGTERM |
-| L-02 | 停机顺序：Admin HTTP drain → 停消费者 → 关闭 AMQP Hub |
-| L-03 | 停机超时（约 15s） |
+| L-02 | 停机顺序：Admin HTTP drain → 停消费者（等待处理中消息完成）→ 关闭 AMQP Hub |
+| L-03 | 停机总超时 15s（覆盖以上全部步骤）；超时后中断处理中消息并 requeue |
 
 ### 5.7 迁移工具 xml2yaml（P0）
 
@@ -263,8 +263,8 @@
 | GET | `/readyz` | 就绪（AMQP ping） |
 | GET | `/metrics` | Prometheus |
 | GET | `/api/jobs` | 任务列表 |
-| GET | `/api/jobs/{id}` | 详情（`name` 或 `name-server`） |
-| POST | `/api/jobs/{id}/workers` | `{"count":N}` |
+| GET | `/api/jobs/{id}` | 详情（`name-server`，或仅绑定一个 server 时的 `name`；有歧义返回 409） |
+| POST | `/api/jobs/{id}/workers` | `{"count":N}`，0–256 |
 | POST | `/api/jobs/{id}/url` | `{"url":"..."}` |
 | POST | `/api/jobs/{id}/block-patterns` | `{"patterns":"..."}` |
 | POST | `/api/jobs/{id}/discard-match` | `{"discard":true}` |
@@ -272,15 +272,17 @@
 | POST | `/api/jobs/{id}/purge` | 清空主队列 |
 | POST | `/api/jobs/{id}/purge-dlq` | 清空 DLQ |
 | GET | `/api/jobs/{id}/peek?count=10` | 窥视（不 ack） |
-| GET | `/api/jobs/{id}/take?count=10` | 取出（ack） |
+| POST | `/api/jobs/{id}/take?count=10` | 取出（ack） |
 | GET | `/api/jobs/{id}/dlq?count=10` | 窥视 DLQ |
-| POST | `/api/jobs/{id}/replay-dlq` | `{"count":10}` 重放 |
+| POST | `/api/jobs/{id}/replay-dlq` | `{"count":10}` 重放（确认重新发布后才 ack DLQ 消息） |
+
+`count` 取值 1–100，缺省 10。错误码：404 job 不存在；409 job 名有歧义；400 参数非法；413 请求体超过 1 MiB。
 
 ### 8.3 指标（Prometheus）
 
 | 指标 | 含义 |
 |------|------|
-| `cd_jobs_processed_total{job,outcome}` | outcome: success / failed / discarded / dlq |
+| `cd_jobs_processed_total{job,outcome}` | outcome: success / failed / discarded / dlq / requeued（停机中断） |
 | `cd_job_duration_seconds{job}` | HTTP 转发耗时 |
 | `cd_workers{job}` | 当前 worker 数 |
 | `cd_inflight_jobs{job}` | 处理中消息数 |
@@ -289,7 +291,7 @@
 
 - 格式：JSON，stdout  
 - 级别：默认 Info  
-- 消费成功：`forward ok`（含 job、attempt、result）  
+- 消费成功：`forward ok`（Debug 级别，含 job、attempt、result）  
 - 失败：`forward failed`（含 result/err；**默认不打印完整 body**）  
 - 与旧版差异：不再按 server 写滚动文件；坏任务以 DLQ 为主
 
@@ -330,6 +332,8 @@ jobs:     [ { name, server, queue, exchange, ... } ]
 
 支持 `${VAR}`、`${VAR:-default}`。示例见 `.env.example`、`configs/config.example.yaml`。
 
+展开在 YAML 解析之后、只作用于标量值：环境变量的值按字面使用（可含 `#`、`:` 等），裸 `$` 不展开。flow 风格（`{...}`、`[...]`）中的 `${VAR}` 需加引号。
+
 ---
 
 ## 10. 消息处理流程
@@ -341,9 +345,10 @@ Consume delivery
     │     └─ discard_match_jobs? → ack + outcome=discarded
     │
     ├─ HTTP forward (1 + retry_limit 次，退避)
-    │     └─ ok? → ack + outcome=success
+    │     ├─ ok? → ack + outcome=success
+    │     └─ 停机中断? → nack requeue + outcome=requeued
     │
-    └─ publish DLQ
+    └─ publish DLQ（confirm + mandatory）
           ├─ ok → ack + outcome=dlq
           └─ fail → nack requeue + outcome=failed
 ```
