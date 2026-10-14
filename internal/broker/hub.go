@@ -49,7 +49,7 @@ func Key(serverName string, srv config.Server) string {
 // Channel returns a new channel on the shared connection for srv.
 func (h *Hub) Channel(serverName string, srv config.Server) (*amqp.Channel, error) {
 	s := h.getOrCreate(serverName, srv)
-	return s.channel()
+	return s.channel(srv)
 }
 
 func (h *Hub) getOrCreate(serverName string, srv config.Server) *session {
@@ -64,9 +64,12 @@ func (h *Hub) getOrCreate(serverName string, srv config.Server) *session {
 	return s
 }
 
-func (s *session) channel() (*amqp.Channel, error) {
+func (s *session) channel(srv config.Server) (*amqp.Channel, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Settings outside the key (e.g. a reloaded password) apply to the next
+	// dial; the current connection stays up.
+	s.srv = srv
 
 	if s.conn == nil || s.conn.IsClosed() {
 		if err := s.dialLocked(); err != nil {
@@ -145,6 +148,29 @@ func (h *Hub) Close() {
 		s.mu.Unlock()
 	}
 	clear(h.sess)
+}
+
+// Prune closes connections whose key is not in inUse and returns their keys.
+func (h *Hub) Prune(inUse map[string]bool) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var closed []string
+	for key, s := range h.sess {
+		if inUse[key] {
+			continue
+		}
+		s.mu.Lock()
+		if s.conn != nil {
+			if err := s.conn.Close(); err != nil {
+				s.log.Warn("amqp close", "err", err)
+			}
+			s.conn = nil
+		}
+		s.mu.Unlock()
+		delete(h.sess, key)
+		closed = append(closed, key)
+	}
+	return closed
 }
 
 // Ping opens and closes a channel to verify connectivity. It returns when ctx

@@ -35,7 +35,9 @@ func run() int {
 		newLogger(slog.LevelInfo).Error("load config", "err", err)
 		return 1
 	}
-	log, closeLog, err := logging.New(cfg.Log, os.Stdout)
+	level := new(slog.LevelVar)
+	level.Set(cfg.Log.SlogLevel())
+	log, closeLog, err := logging.New(cfg.Log, level, os.Stdout)
 	if err != nil {
 		newLogger(slog.LevelInfo).Error("open log", "err", err)
 		return 1
@@ -64,7 +66,15 @@ func run() int {
 	if !adminSrv.AuthEnabled() {
 		log.Warn("admin API has no authentication; set admin.tokens and/or admin.tls.client_ca_file")
 	}
+	rl := &reloader{path: *cfgPath, log: log, level: level, jobs: mgr, tokens: adminSrv.SetTokens, cur: cfg}
+	adminSrv.SetReloadFunc(rl.reload)
+	// Register before anything else can deliver SIGHUP, whose default
+	// action would terminate the process.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
 	mgr.StartAll()
+	go reloadOnSignal(ctx, hup, rl, log)
 
 	srv := &http.Server{
 		Addr:              cfg.Admin.Addr(),
@@ -112,6 +122,20 @@ func run() int {
 	mgr.StopAll(shutdownCtx)
 	log.Info("bye")
 	return code
+}
+
+// reloadOnSignal reloads the config on each signal from hup until ctx ends.
+func reloadOnSignal(ctx context.Context, hup <-chan os.Signal, rl *reloader, log *slog.Logger) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-hup:
+			log.Info("SIGHUP received, reloading config")
+			// Errors are already logged by the reloader.
+			_, _ = rl.reload(ctx, false)
+		}
+	}
 }
 
 func newLogger(level slog.Level) *slog.Logger {

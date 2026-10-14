@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -40,11 +41,19 @@ var (
 
 // Manager owns shared broker connections and all job worker pools.
 type Manager struct {
-	pools  map[string]*worker.Pool // immutable after New
 	hub    *broker.Hub
 	client *forward.Client
 	log    *slog.Logger
 	ready  atomic.Bool
+
+	mu    sync.RWMutex
+	pools map[string]*worker.Pool
+	// file holds jobs as last loaded from the config file, so a reload can
+	// tell file changes apart from changes made through the admin API.
+	file map[string]config.ResolvedJob
+	opts Options
+
+	reloadMu sync.Mutex // serializes Reload
 }
 
 // Options configure all pools created by a Manager.
@@ -54,14 +63,38 @@ type Options = worker.Options
 func New(jobs []config.ResolvedJob, opts Options, log *slog.Logger) *Manager {
 	m := &Manager{
 		pools:  make(map[string]*worker.Pool, len(jobs)),
+		file:   make(map[string]config.ResolvedJob, len(jobs)),
+		opts:   opts,
 		hub:    broker.NewHub(log),
-		client: forward.New(MaxJobTimeout(jobs) + 5*time.Second),
+		client: forward.New(clientTimeout(jobs)),
 		log:    log,
 	}
 	for _, j := range jobs {
 		m.pools[j.LogicName] = worker.NewPool(j, m.hub, m.client, opts, log)
+		m.file[j.LogicName] = j
 	}
 	return m
+}
+
+func clientTimeout(jobs []config.ResolvedJob) time.Duration {
+	return MaxJobTimeout(jobs) + 5*time.Second
+}
+
+// snapshot returns the current pools.
+func (m *Manager) snapshot() []*worker.Pool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return slices.Collect(maps.Values(m.pools))
+}
+
+// MaxTimeout returns the largest per-request timeout of the current jobs (at least 30s).
+func (m *Manager) MaxTimeout() time.Duration {
+	pools := m.snapshot()
+	jobs := make([]config.ResolvedJob, 0, len(pools))
+	for _, p := range pools {
+		jobs = append(jobs, p.Job())
+	}
+	return MaxJobTimeout(jobs)
 }
 
 // MaxJobTimeout returns the largest per-request timeout among jobs (at least 30s).
@@ -75,7 +108,7 @@ func MaxJobTimeout(jobs []config.ResolvedJob) time.Duration {
 
 // StartAll starts every pool with its configured worker count.
 func (m *Manager) StartAll() {
-	for _, p := range m.pools {
+	for _, p := range m.snapshot() {
 		j := p.Job()
 		m.log.Info("starting job", "job", j.String())
 		p.SetWorkers(j.Count)
@@ -87,12 +120,19 @@ func (m *Manager) StartAll() {
 // connections. In-flight messages are aborted and requeued when ctx ends.
 func (m *Manager) StopAll(ctx context.Context) {
 	m.ready.Store(false)
+	// Wait for a running reload so it cannot start pools after this point.
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	shutdownPools(ctx, m.snapshot())
+	m.hub.Close()
+}
+
+func shutdownPools(ctx context.Context, pools []*worker.Pool) {
 	var wg sync.WaitGroup
-	for _, p := range m.pools {
+	for _, p := range pools {
 		wg.Go(func() { p.Shutdown(ctx) })
 	}
 	wg.Wait()
-	m.hub.Close()
 }
 
 // Ready reports whether StartAll has run and StopAll has not.
@@ -101,7 +141,7 @@ func (m *Manager) Ready() bool { return m.ready.Load() }
 // Ping verifies connectivity to every RabbitMQ server used by a job.
 func (m *Manager) Ping(ctx context.Context) error {
 	servers := make(map[string]config.Server)
-	for _, p := range m.pools {
+	for _, p := range m.snapshot() {
 		j := p.Job()
 		servers[j.ServerName] = j.Server
 	}
@@ -152,8 +192,9 @@ func status(p *worker.Pool) JobStatus {
 
 // List returns all jobs sorted by logic name.
 func (m *Manager) List() []JobStatus {
-	out := make([]JobStatus, 0, len(m.pools))
-	for _, p := range m.pools {
+	pools := m.snapshot()
+	out := make([]JobStatus, 0, len(pools))
+	for _, p := range pools {
 		out = append(out, status(p))
 	}
 	slices.SortFunc(out, func(a, b JobStatus) int { return cmp.Compare(a.LogicName, b.LogicName) })
@@ -172,6 +213,8 @@ func (m *Manager) Get(id string) (JobStatus, error) {
 // pool resolves id as a logic name ("name-server"), or as a bare job name when
 // that name is bound to exactly one server.
 func (m *Manager) pool(id string) (*worker.Pool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if p, ok := m.pools[id]; ok {
 		return p, nil
 	}

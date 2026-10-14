@@ -165,8 +165,8 @@
 | F-10 | Admin API 鉴权（Token / mTLS） | P1 | 已完成：`admin.tokens`（Bearer）+ 可选 `admin.tls`（HTTPS / 客户端证书），仅保护 `/api/*`；写操作审计日志 |
 | F-11 | 下游熔断（连续失败暂停 job） | P1 | **不做**（决策）：重试耗尽的消息直接进 DLQ，可 replay |
 | F-12 | 失败日志可选记录 body（采样 / 截断） | P1 | 已完成：`log.failed_body`（默认关闭，`max_bytes` 截断、`sample_rate` 采样）；`log.level` 可配置 |
-| F-13 | 多副本协调 purge（原 ZK 主从诉求的现代替代） | P2 |
-| F-14 | 配置热加载 | P2 |
+| F-13 | 多副本协调 purge（原 ZK 主从诉求的现代替代） | P2 | 未开始 |
+| F-14 | 配置热加载 | P2 | 已完成：`POST /api/reload`（支持 `dry_run`）与 SIGHUP；校验失败保持旧配置；按 job 增 / 删 / 更新 / 扩缩容 / 重建，Admin API 的临时修改仅在文件同一项变化时被覆盖；监听地址、TLS、日志输出需重启 |
 
 ---
 
@@ -262,6 +262,7 @@
 | GET | `/healthz` | 存活 |
 | GET | `/readyz` | 就绪（AMQP ping） |
 | GET | `/metrics` | Prometheus |
+| POST | `/api/reload` | 重新加载配置文件（`?dry_run=true` 只预览）；也可发 SIGHUP |
 | GET | `/api/jobs` | 任务列表 |
 | GET | `/api/jobs/{id}` | 详情（`name-server`，或仅绑定一个 server 时的 `name`；有歧义返回 409） |
 | POST | `/api/jobs/{id}/workers` | `{"count":N}`，0–256 |

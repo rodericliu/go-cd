@@ -98,6 +98,7 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" localhost:8888/api/jobs
 | GET | `/healthz` | 存活探针 |
 | GET | `/readyz` | 就绪探针（含 AMQP ping） |
 | GET | `/metrics` | Prometheus |
+| POST | `/api/reload` | 重新加载配置文件（`?dry_run=true` 只预览），见下文 |
 | GET | `/api/jobs` | 任务列表 |
 | GET | `/api/jobs/{id}` | 任务详情（`name-server`；job 只绑定一个 server 时也可用 `name`） |
 | POST | `/api/jobs/{id}/workers` | `{"count":N}` 扩缩容（0–256） |
@@ -113,6 +114,41 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" localhost:8888/api/jobs
 | POST | `/api/jobs/{id}/replay-dlq` | `{"count":10}` 重放到主队列 |
 
 `count` 取值 1–100，缺省 10。`{id}` 用多 server job 的裸 `name` 时返回 **409**，需改用 `name-server`。其他错误：404 不存在、400 参数非法、413 请求体超过 1 MiB。
+
+通过 Admin API 做的修改只保存在内存里，重启后恢复为配置文件的值。
+
+### 配置热加载
+
+修改配置文件后，不用重启就能生效：
+
+```bash
+curl -XPOST -H "Authorization: Bearer $ADMIN_TOKEN" 'localhost:8888/api/reload?dry_run=true'  # 先预览
+curl -XPOST -H "Authorization: Bearer $ADMIN_TOKEN" localhost:8888/api/reload                # 生效
+kill -HUP <pid>                                                                              # 或发信号
+```
+
+- 新配置先完整校验；有错误时返回 400，**继续使用当前配置**（SIGHUP 时错误写入日志）。
+- 按逻辑名（`name-server`）对比新旧 job：
+
+| 变化 | 处理 |
+|------|------|
+| 新增 job | 创建并开始消费 |
+| 删除 job | 处理完手上的消息后停止（最多等 15 秒，超时的消息退回队列） |
+| 只改了 `count` | 直接扩缩容 |
+| 改了 `url`、`url_host`、`timeout_ms`、`retry_limit`、`prefetch`、`block_patterns`、`discard_match_jobs`、`encoding` | 平滑替换 worker |
+| 改了队列、exchange、路由、durable、`declare_topology` 或 server 连接参数 | 停掉后按新配置重建 |
+
+- 通过 Admin API 做的临时修改：只有文件里**同一项**改了才会被覆盖，其他保留。重建的 job 完全以文件为准。
+- `admin.tokens`、`log.level`、`log.failed_body` 也会热加载；`admin.host`/`port`/`tls`、`log.file`、`log.stdout` 需要重启，返回结果的 `restart_required` 里会列出来。
+- 不再被任何 job 使用的 RabbitMQ 连接会被关闭。
+- 多副本部署时每个实例要分别触发。
+
+返回示例：
+
+```json
+{"dry_run":false,"jobs":{"added":["sms-a"],"removed":["pay-a"],"updated":["mail-a"],"scaled":[],"recreated":[],"unchanged":3},
+ "settings":["log.level"],"restart_required":[]}
+```
 
 ## 测试
 

@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"consumer-dispatcher/internal/config"
@@ -31,21 +32,30 @@ type Options struct {
 }
 
 type authenticator struct {
-	digests    [][sha256.Size]byte
+	// digests can be swapped on config reload.
+	digests    atomic.Pointer[[][sha256.Size]byte]
 	clientCert bool
 	log        *slog.Logger
 }
 
 func newAuthenticator(opts Options, log *slog.Logger) *authenticator {
 	a := &authenticator{clientCert: opts.RequireClientCert, log: log}
-	for _, t := range opts.Tokens {
-		a.digests = append(a.digests, sha256.Sum256([]byte(t)))
-	}
+	a.setTokens(opts.Tokens)
 	return a
 }
 
+func (a *authenticator) setTokens(tokens []string) {
+	digests := make([][sha256.Size]byte, 0, len(tokens))
+	for _, t := range tokens {
+		digests = append(digests, sha256.Sum256([]byte(t)))
+	}
+	a.digests.Store(&digests)
+}
+
+func (a *authenticator) tokens() [][sha256.Size]byte { return *a.digests.Load() }
+
 // enabled reports whether any authentication is configured.
-func (a *authenticator) enabled() bool { return len(a.digests) > 0 || a.clientCert }
+func (a *authenticator) enabled() bool { return len(a.tokens()) > 0 || a.clientCert }
 
 // authenticate returns a non-secret identity for audit logs, or an error
 // message suitable for the client.
@@ -57,8 +67,8 @@ func (a *authenticator) authenticate(r *http.Request) (string, error) {
 		}
 		ids = append(ids, "cert:"+r.TLS.VerifiedChains[0][0].Subject.CommonName)
 	}
-	if len(a.digests) > 0 {
-		idx, ok := a.matchToken(r.Header.Get("Authorization"))
+	if digests := a.tokens(); len(digests) > 0 {
+		idx, ok := matchToken(digests, r.Header.Get("Authorization"))
 		if !ok {
 			return "", errors.New("missing or invalid bearer token")
 		}
@@ -72,14 +82,14 @@ func (a *authenticator) authenticate(r *http.Request) (string, error) {
 
 // matchToken compares SHA-256 digests in constant time, so neither the token
 // content nor its length leaks through timing.
-func (a *authenticator) matchToken(header string) (int, bool) {
+func matchToken(digests [][sha256.Size]byte, header string) (int, bool) {
 	const scheme = "bearer "
 	if len(header) <= len(scheme) || !strings.EqualFold(header[:len(scheme)], scheme) {
 		return 0, false
 	}
 	sum := sha256.Sum256([]byte(strings.TrimSpace(header[len(scheme):])))
 	match := -1
-	for i, d := range a.digests {
+	for i, d := range digests {
 		if subtle.ConstantTimeCompare(sum[:], d[:]) == 1 && match < 0 {
 			match = i
 		}
@@ -99,7 +109,7 @@ func (a *authenticator) protect(next http.Handler) http.Handler {
 		if err != nil {
 			a.log.Warn("admin auth failed",
 				"method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr, "reason", err.Error())
-			if len(a.digests) > 0 {
+			if len(a.tokens()) > 0 {
 				w.Header().Set("WWW-Authenticate", `Bearer realm="consumer-dispatcher"`)
 			}
 			http.Error(w, err.Error(), http.StatusUnauthorized)

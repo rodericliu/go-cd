@@ -40,7 +40,7 @@ func TestNew(t *testing.T) {
 				path = filepath.Join(t.TempDir(), "sub", "dir", "cd.log") // parent dirs are created
 			}
 			var stdout bytes.Buffer
-			log, closeFn, err := New(logConfig(path, tt.stdout), &stdout)
+			log, closeFn, err := New(logConfig(path, tt.stdout), nil, &stdout)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -76,7 +76,7 @@ func TestNewUnwritablePath(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A regular file cannot be used as a directory.
-	_, _, err := New(logConfig(filepath.Join(blocker, "cd.log"), false), &bytes.Buffer{})
+	_, _, err := New(logConfig(filepath.Join(blocker, "cd.log"), false), nil, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "log.file.path") {
 		t.Fatalf("err = %v, want log.file.path error", err)
 	}

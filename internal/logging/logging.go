@@ -14,13 +14,17 @@ import (
 )
 
 // New returns a JSON logger for cfg and a close function that releases the
-// log file. Without a file, logs go to stdout.
-func New(cfg config.Log, stdout io.Writer) (*slog.Logger, func() error, error) {
+// log file. Without a file, logs go to stdout. Pass a *slog.LevelVar as level
+// to change the level at runtime; nil uses cfg.Level.
+func New(cfg config.Log, level slog.Leveler, stdout io.Writer) (*slog.Logger, func() error, error) {
 	w, closeFn, err := Writer(cfg, stdout)
 	if err != nil {
 		return nil, nil, err
 	}
-	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: cfg.SlogLevel()})), closeFn, nil
+	if level == nil {
+		level = cfg.SlogLevel()
+	}
+	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level})), closeFn, nil
 }
 
 // Writer returns where logs are written according to cfg.

@@ -24,10 +24,11 @@ const (
 
 // Server exposes REST admin + Prometheus metrics.
 type Server struct {
-	mgr  *manager.Manager
-	log  *slog.Logger
-	mux  *http.ServeMux
-	auth *authenticator
+	mgr      *manager.Manager
+	log      *slog.Logger
+	mux      *http.ServeMux
+	auth     *authenticator
+	reloadFn ReloadFunc
 }
 
 // New registers all admin routes for mgr.
@@ -36,6 +37,9 @@ func New(mgr *manager.Manager, opts Options, log *slog.Logger) *Server {
 	s.routes()
 	return s
 }
+
+// SetReloadFunc enables POST /api/reload. Call it before serving.
+func (s *Server) SetReloadFunc(fn ReloadFunc) { s.reloadFn = fn }
 
 // AuthEnabled reports whether /api/* requires credentials.
 func (s *Server) AuthEnabled() bool { return s.auth.enabled() }
@@ -50,6 +54,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /readyz", s.readiness)
 	s.mux.Handle("GET /metrics", promhttp.Handler())
 
+	s.mux.HandleFunc("POST /api/reload", s.reload)
 	s.mux.HandleFunc("GET /api/jobs", s.listJobs)
 	s.mux.HandleFunc("GET /api/jobs/{id}", s.getJob)
 	s.mux.HandleFunc("POST /api/jobs/{id}/workers", s.setWorkers)
@@ -170,6 +175,9 @@ func (s *Server) tryJob(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body, false) {
 		return
 	}
+	// The server-wide write timeout is sized at startup; a reload may add
+	// jobs with longer timeouts.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.mgr.MaxTimeout() + 10*time.Second))
 	result, err := s.mgr.Try(r.Context(), r.PathValue("id"), body.Body)
 	if err != nil {
 		if isClientErr(err) {

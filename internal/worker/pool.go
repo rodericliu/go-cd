@@ -97,6 +97,15 @@ func (p *Pool) retireLocked(ws []*Worker) {
 // UpdateJob applies mut to the job config and replaces all workers so the
 // change takes effect. Old workers finish their in-flight message first.
 func (p *Pool) UpdateJob(mut func(*config.ResolvedJob)) {
+	p.replace(func() { mut(&p.job) })
+}
+
+// UpdateOptions replaces the pool options and its workers, like UpdateJob.
+func (p *Pool) UpdateOptions(opts Options) {
+	p.replace(func() { p.opts = opts })
+}
+
+func (p *Pool) replace(mut func()) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
@@ -105,7 +114,7 @@ func (p *Pool) UpdateJob(mut func(*config.ResolvedJob)) {
 	n := len(p.workers)
 	p.retireLocked(p.workers)
 	p.workers = nil
-	mut(&p.job)
+	mut()
 	p.resizeLocked(n)
 }
 
