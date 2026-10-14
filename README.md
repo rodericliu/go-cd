@@ -4,7 +4,7 @@ RabbitMQ → HTTP 转发调度器。从队列取消息，以 `application/x-www-
 
 本目录为 Go 重写实现。需要 **Go 1.27+**。原版 Java 在仓库根目录。
 
-产品需求与设计说明见 [docs/PRD.md](docs/PRD.md)。
+产品需求与设计说明见 [docs/PRD.md](docs/PRD.md)，代码审查与修复记录见 [docs/CODE_REVIEW.md](docs/CODE_REVIEW.md)。
 
 ## 快速开始
 
