@@ -3,11 +3,9 @@ package config
 import (
 	"errors"
 	"fmt"
-	"net"
 	"net/url"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -23,6 +21,7 @@ const (
 type File struct {
 	Defaults Defaults          `yaml:"defaults"`
 	Admin    Admin             `yaml:"admin"`
+	Log      Log               `yaml:"log"`
 	Servers  map[string]Server `yaml:"servers"`
 	Jobs     []Job             `yaml:"jobs"`
 }
@@ -38,11 +37,6 @@ type Defaults struct {
 	RetryLimit      *int   `yaml:"retry_limit"`
 	Prefetch        int    `yaml:"prefetch"`
 	DeclareTopology *bool  `yaml:"declare_topology"`
-}
-
-type Admin struct {
-	Host string `yaml:"host"`
-	Port int    `yaml:"port"`
 }
 
 type Server struct {
@@ -218,13 +212,10 @@ func applyDefaults(cfg *File) error {
 	if cfg.Defaults.Prefetch <= 0 {
 		cfg.Defaults.Prefetch = 1
 	}
-	if cfg.Admin.Host == "" {
-		cfg.Admin.Host = "0.0.0.0"
+	if err := cfg.Admin.normalize(); err != nil {
+		return err
 	}
-	if cfg.Admin.Port <= 0 {
-		cfg.Admin.Port = 8888
-	}
-	return nil
+	return cfg.Log.normalize()
 }
 
 func resolveJobs(cfg *File) ([]ResolvedJob, error) {
@@ -407,9 +398,4 @@ func boolOrDefault(p *bool, def bool) bool {
 func (j ResolvedJob) String() string {
 	return fmt.Sprintf("job=%s server=%s queue=%s url=%s workers=%d timeout=%s retry=%d prefetch=%d",
 		j.LogicName, j.ServerName, j.Queue, j.URL, j.Count, j.Timeout, j.RetryLimit, j.Prefetch)
-}
-
-// Addr returns admin listen address.
-func (a Admin) Addr() string {
-	return net.JoinHostPort(a.Host, strconv.Itoa(a.Port))
 }

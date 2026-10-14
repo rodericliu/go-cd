@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
@@ -54,11 +55,12 @@ type publisher interface {
 // in-flight message finish; abort additionally cancels the in-flight message,
 // which is then requeued rather than dead-lettered.
 type Worker struct {
-	job   config.ResolvedJob
-	src   ChannelSource
-	fwd   Forwarder
-	log   *slog.Logger
-	stats *Stats
+	job        config.ResolvedJob
+	src        ChannelSource
+	fwd        Forwarder
+	log        *slog.Logger
+	stats      *Stats
+	failedBody config.FailedBody
 
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -66,15 +68,16 @@ type Worker struct {
 	done     chan struct{}
 }
 
-func newWorker(job config.ResolvedJob, src ChannelSource, fwd Forwarder, stats *Stats, log *slog.Logger) *Worker {
+func newWorker(job config.ResolvedJob, src ChannelSource, fwd Forwarder, stats *Stats, opts Options, log *slog.Logger) *Worker {
 	return &Worker{
-		job:   job,
-		src:   src,
-		fwd:   fwd,
-		log:   log.With("job", job.LogicName),
-		stats: stats,
-		stop:  make(chan struct{}),
-		done:  make(chan struct{}),
+		job:        job,
+		src:        src,
+		fwd:        fwd,
+		log:        log.With("job", job.LogicName),
+		stats:      stats,
+		failedBody: opts.FailedBody,
+		stop:       make(chan struct{}),
+		done:       make(chan struct{}),
 	}
 }
 
@@ -259,13 +262,40 @@ func (w *Worker) deadLetter(ctx context.Context, pub publisher, d amqp.Delivery)
 			w.nack(d, outcomeRequeued)
 			return
 		}
-		w.log.Error("publish dlq failed, nack requeue", "err", err)
+		w.log.Error("publish dlq failed, nack requeue", append([]any{"err", err}, w.bodyAttrs(d.Body)...)...)
 		w.nack(d, outcomeFailed)
 		w.stats.failed.Add(1)
 		return
 	}
+	w.log.Warn("message dead-lettered", append([]any{"dlq", w.job.DLQ}, w.bodyAttrs(d.Body)...)...)
 	w.ack(d, outcomeDLQ)
 	w.stats.failed.Add(1)
+}
+
+// bodyAttrs returns log attributes for a failed message body when body
+// logging is enabled and this message is sampled; otherwise nil.
+func (w *Worker) bodyAttrs(body []byte) []any {
+	fb := w.failedBody
+	if !fb.Enabled {
+		return nil
+	}
+	if r := fb.Rate(); r < 1 && rand.Float64() >= r {
+		return nil
+	}
+	s, truncated := truncateUTF8(body, fb.MaxBytes)
+	return []any{"body", s, "body_bytes", len(body), "body_truncated", truncated}
+}
+
+// truncateUTF8 cuts b to at most n bytes without splitting a UTF-8 sequence.
+func truncateUTF8(b []byte, n int) (string, bool) {
+	if len(b) <= n {
+		return string(b), false
+	}
+	cut := n
+	for cut > 0 && !utf8.RuneStart(b[cut]) {
+		cut--
+	}
+	return string(b[:cut]), true
 }
 
 func (w *Worker) ack(d amqp.Delivery, outcome string) {

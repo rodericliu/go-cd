@@ -15,6 +15,11 @@ import (
 
 func newTestHandler(t *testing.T) http.Handler {
 	t.Helper()
+	return newTestHandlerWith(t, Options{}, slog.New(slog.DiscardHandler))
+}
+
+func newTestHandlerWith(t *testing.T, opts Options, log *slog.Logger) http.Handler {
+	t.Helper()
 	srv := config.Server{Host: "127.0.0.1", Port: 1, Username: "u", VHost: "/", ReconnectSeconds: 30}
 	job := func(name, server string) config.ResolvedJob {
 		return config.ResolvedJob{
@@ -22,10 +27,9 @@ func newTestHandler(t *testing.T) http.Handler {
 			Queue: name, DLQ: name + ".dlq", URL: "http://consumer/d", Timeout: time.Second,
 		}
 	}
-	log := slog.New(slog.DiscardHandler)
-	mgr := manager.New([]config.ResolvedJob{job("mail", "a"), job("mail", "b"), job("pay", "a")}, log)
+	mgr := manager.New([]config.ResolvedJob{job("mail", "a"), job("mail", "b"), job("pay", "a")}, manager.Options{}, log)
 	t.Cleanup(func() { mgr.StopAll(t.Context()) })
-	return New(mgr, log).Handler()
+	return New(mgr, opts, log).Handler()
 }
 
 func TestRoutes(t *testing.T) {

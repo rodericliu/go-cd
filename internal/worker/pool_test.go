@@ -39,7 +39,7 @@ func (s *fakeSource) Calls() int {
 }
 
 func newTestPool(src ChannelSource) *Pool {
-	return NewPool(testJob(), src, &fakeForwarder{results: []bool{true}}, discardLog)
+	return NewPool(testJob(), src, &fakeForwarder{results: []bool{true}}, Options{}, discardLog)
 }
 
 // synctest.Test fails if any goroutine is still running at the end, so these

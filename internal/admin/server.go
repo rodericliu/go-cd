@@ -24,21 +24,25 @@ const (
 
 // Server exposes REST admin + Prometheus metrics.
 type Server struct {
-	mgr *manager.Manager
-	log *slog.Logger
-	mux *http.ServeMux
+	mgr  *manager.Manager
+	log  *slog.Logger
+	mux  *http.ServeMux
+	auth *authenticator
 }
 
 // New registers all admin routes for mgr.
-func New(mgr *manager.Manager, log *slog.Logger) *Server {
-	s := &Server{mgr: mgr, log: log, mux: http.NewServeMux()}
+func New(mgr *manager.Manager, opts Options, log *slog.Logger) *Server {
+	s := &Server{mgr: mgr, log: log, mux: http.NewServeMux(), auth: newAuthenticator(opts, log)}
 	s.routes()
 	return s
 }
 
-// Handler returns the root handler with panic recovery.
+// AuthEnabled reports whether /api/* requires credentials.
+func (s *Server) AuthEnabled() bool { return s.auth.enabled() }
+
+// Handler returns the root handler with panic recovery and authentication.
 func (s *Server) Handler() http.Handler {
-	return recovery(s.log, s.mux)
+	return recovery(s.log, s.auth.protect(s.mux))
 }
 
 func (s *Server) routes() {

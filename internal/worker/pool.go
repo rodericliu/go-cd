@@ -16,6 +16,11 @@ type Stats struct {
 	failed    atomic.Int64
 }
 
+// Options are settings shared by all workers of a pool.
+type Options struct {
+	FailedBody config.FailedBody
+}
+
 // Pool manages N workers for one job and supports scaling.
 //
 // Workers being removed are stopped in the background; the pool lock is never
@@ -25,6 +30,7 @@ type Pool struct {
 	fwd   Forwarder
 	log   *slog.Logger
 	stats *Stats
+	opts  Options
 
 	mu       sync.Mutex
 	job      config.ResolvedJob
@@ -34,12 +40,13 @@ type Pool struct {
 }
 
 // NewPool returns a pool with no running workers.
-func NewPool(job config.ResolvedJob, src ChannelSource, fwd Forwarder, log *slog.Logger) *Pool {
+func NewPool(job config.ResolvedJob, src ChannelSource, fwd Forwarder, opts Options, log *slog.Logger) *Pool {
 	return &Pool{
 		job:      job,
 		src:      src,
 		fwd:      fwd,
 		log:      log,
+		opts:     opts,
 		stats:    &Stats{},
 		retiring: make(map[*Worker]struct{}),
 	}
@@ -61,7 +68,7 @@ func (p *Pool) resizeLocked(n int) {
 	switch {
 	case n > cur:
 		for range n - cur {
-			w := newWorker(p.job, p.src, p.fwd, p.stats, p.log)
+			w := newWorker(p.job, p.src, p.fwd, p.stats, p.opts, p.log)
 			w.start()
 			p.workers = append(p.workers, w)
 		}

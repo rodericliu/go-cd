@@ -228,6 +228,71 @@ func TestExampleConfigLoads(t *testing.T) {
 	}
 }
 
+const minimalServersAndJobs = `
+servers:
+  a: {host: h, port: 5672, username: u, password: p, vhost: /}
+jobs:
+  - {name: j, server: a, url: "http://x/d"}
+`
+
+func TestAdminAndLogDefaults(t *testing.T) {
+	cfg, _, err := Load(writeConfig(t, minimalServersAndJobs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Admin.Tokens) != 0 || cfg.Admin.TLS.Enabled() || cfg.Admin.TLS.RequireClientCert() {
+		t.Fatalf("admin auth should be off by default: %+v", cfg.Admin)
+	}
+	fb := cfg.Log.FailedBody
+	if cfg.Log.Level != "info" || fb.Enabled || fb.MaxBytes != 512 || fb.Rate() != 1 {
+		t.Fatalf("log defaults: %+v", cfg.Log)
+	}
+}
+
+func TestAdminTokensFromEnv(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "  0123456789abcdef-secret  ")
+	cfg, _, err := Load(writeConfig(t, `
+admin:
+  tokens: ["${ADMIN_TOKEN}", "${UNSET_TOKEN:-}"]
+log:
+  level: DEBUG
+  failed_body: {enabled: true, max_bytes: 100, sample_rate: 0.25}
+`+minimalServersAndJobs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Admin.Tokens) != 1 || cfg.Admin.Tokens[0] != "0123456789abcdef-secret" {
+		t.Fatalf("tokens = %q (unset entries dropped, whitespace trimmed)", cfg.Admin.Tokens)
+	}
+	if cfg.Log.SlogLevel().String() != "DEBUG" || cfg.Log.FailedBody.Rate() != 0.25 || cfg.Log.FailedBody.MaxBytes != 100 {
+		t.Fatalf("log = %+v", cfg.Log)
+	}
+}
+
+func TestAdminAndLogValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		section string
+		wantErr string
+	}{
+		{name: "short token", section: "admin: {tokens: [short]}", wantErr: "at least 16"},
+		{name: "cert without key", section: "admin: {tls: {cert_file: c.pem}}", wantErr: "together"},
+		{name: "client ca without cert", section: "admin: {tls: {client_ca_file: ca.pem}}", wantErr: "client_ca_file requires"},
+		{name: "bad log level", section: "log: {level: verbose}", wantErr: "log.level"},
+		{name: "max_bytes too large", section: "log: {failed_body: {max_bytes: 1000000}}", wantErr: "max_bytes"},
+		{name: "sample_rate zero", section: "log: {failed_body: {sample_rate: 0}}", wantErr: "sample_rate"},
+		{name: "sample_rate above one", section: "log: {failed_body: {sample_rate: 1.5}}", wantErr: "sample_rate"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := Load(writeConfig(t, tt.section+"\n"+minimalServersAndJobs))
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("err = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestAdminAddr(t *testing.T) {
 	if got := (Admin{Host: "::1", Port: 8888}).Addr(); got != "[::1]:8888" {
 		t.Fatalf("addr = %q", got)

@@ -15,6 +15,24 @@ defaults:
 admin:
   host: "0.0.0.0"
   port: 8888
+  # /api/* 需要 "Authorization: Bearer <token>"；每个 token 至少 16 个字符。
+  # 未设置的环境变量（空串）会被忽略；一个 token 都没有时 /api/* 不鉴权（启动时打 Warn）。
+  # /healthz、/readyz、/metrics 始终免鉴权。
+  tokens:
+    - ${ADMIN_TOKEN:-}
+  # tls:
+  #   cert_file: /etc/cd/tls/tls.crt
+  #   key_file: /etc/cd/tls/tls.key
+  #   # 配置后 /api/* 必须携带此 CA 签发的客户端证书（与 token 同时配置时两者都要满足）
+  #   client_ca_file: /etc/cd/tls/client-ca.crt
+
+log:
+  level: ${LOG_LEVEL:-info}   # debug | info | warn | error
+  # 消息进入 DLQ 时是否在日志中记录 body（可能含敏感数据，默认关闭）
+  failed_body:
+    enabled: false
+    max_bytes: 512     # 超出部分截断（按 UTF-8 字符边界）
+    sample_rate: 1.0   # (0, 1]，只记录这一比例的失败消息
 
 servers:
   site_a:

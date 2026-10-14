@@ -47,8 +47,11 @@ type Manager struct {
 	ready  atomic.Bool
 }
 
+// Options configure all pools created by a Manager.
+type Options = worker.Options
+
 // New creates pools for jobs; call StartAll to begin consuming.
-func New(jobs []config.ResolvedJob, log *slog.Logger) *Manager {
+func New(jobs []config.ResolvedJob, opts Options, log *slog.Logger) *Manager {
 	m := &Manager{
 		pools:  make(map[string]*worker.Pool, len(jobs)),
 		hub:    broker.NewHub(log),
@@ -56,7 +59,7 @@ func New(jobs []config.ResolvedJob, log *slog.Logger) *Manager {
 		log:    log,
 	}
 	for _, j := range jobs {
-		m.pools[j.LogicName] = worker.NewPool(j, m.hub, m.client, log)
+		m.pools[j.LogicName] = worker.NewPool(j, m.hub, m.client, opts, log)
 	}
 	return m
 }

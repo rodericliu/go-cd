@@ -149,7 +149,7 @@ func TestHandle(t *testing.T) {
 				pub := &fakePublisher{err: tt.pubErr}
 				acker := &fakeAcker{}
 				stats := &Stats{}
-				w := newWorker(job, nil, fwd, stats, discardLog)
+				w := newWorker(job, nil, fwd, stats, Options{}, discardLog)
 
 				w.handle(t.Context(), pub, re, amqp.Delivery{Acknowledger: acker, Body: []byte("hello")})
 
@@ -196,7 +196,7 @@ func TestHandleAbortRequeues(t *testing.T) {
 				stats := &Stats{}
 				job := testJob()
 				job.RetryLimit = 5
-				w := newWorker(job, nil, fwd, stats, discardLog)
+				w := newWorker(job, nil, fwd, stats, Options{}, discardLog)
 
 				done := make(chan struct{})
 				go func() {
@@ -225,7 +225,7 @@ func TestBackoffIsBoundedAndJittered(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		job := testJob()
 		job.RetryLimit = 10
-		w := newWorker(job, nil, &fakeForwarder{results: []bool{false}}, &Stats{}, discardLog)
+		w := newWorker(job, nil, &fakeForwarder{results: []bool{false}}, &Stats{}, Options{}, discardLog)
 
 		start := time.Now()
 		w.forwardWithRetry(t.Context(), "x")

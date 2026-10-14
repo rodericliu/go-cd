@@ -22,7 +22,7 @@ func testJobs() []config.ResolvedJob {
 
 func newTestManager(t *testing.T) *Manager {
 	t.Helper()
-	m := New(testJobs(), slog.New(slog.DiscardHandler))
+	m := New(testJobs(), Options{}, slog.New(slog.DiscardHandler))
 	t.Cleanup(func() { m.StopAll(t.Context()) })
 	return m
 }

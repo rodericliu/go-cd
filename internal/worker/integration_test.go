@@ -130,7 +130,7 @@ func TestIntegrationShutdownRequeuesInFlight(t *testing.T) {
 	job, hub := integrationJob(t, consumer.URL)
 	publishTo(t, hub, job, "in-flight")
 
-	p := NewPool(job, hub, forward.New(10*time.Second), discardLog)
+	p := NewPool(job, hub, forward.New(10*time.Second), Options{}, discardLog)
 	p.SetWorkers(1)
 	select {
 	case <-received:
@@ -158,7 +158,7 @@ func TestIntegrationFailureGoesToDLQ(t *testing.T) {
 	job, hub := integrationJob(t, consumer.URL)
 	publishTo(t, hub, job, "bad")
 
-	p := NewPool(job, hub, forward.New(10*time.Second), discardLog)
+	p := NewPool(job, hub, forward.New(10*time.Second), Options{}, discardLog)
 	p.SetWorkers(1)
 	t.Cleanup(func() { p.Shutdown(context.Background()) })
 
