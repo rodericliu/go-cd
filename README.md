@@ -155,11 +155,65 @@ curl -s -XPOST -H "$AUTH" "$API/purge"
 curl -s -XPOST -H "$AUTH" -d '{"count":2}' "$API/workers"
 ```
 
-#### 多副本
+#### 多副本（Podman 多容器）
 
-可以任选下面一种方法：
+假设多个容器的名字都带 `consumer-dispatcher`（如 `consumer-dispatcher-1`、`consumer-dispatcher-2`）。可以任选下面一种方法：
 
-**方法一：先缩容到 1 个副本**（最简单，但缩容期间其他 job 的消费能力会下降）
+**方法一：只留一个容器，停掉其他的**（最简单，但停止期间其他 job 的消费能力会下降）
+
+```bash
+podman ps --filter name=consumer-dispatcher --format '{{.Names}}'   # 查看所有实例
+
+# -t 20：给程序留出优雅停机时间（程序最多用 15 秒处理完手上的消息）。
+# podman stop 默认只等 10 秒，超时会强杀。
+podman stop -t 20 consumer-dispatcher-2 consumer-dispatcher-3
+
+# 在剩下的 consumer-dispatcher-1 上按「单副本」的步骤 1–5 操作（API 用它映射到宿主机的端口）
+
+podman start consumer-dispatcher-2 consumer-dispatcher-3
+```
+
+**方法二：逐个容器把 worker 设为 0**（不影响其他 job）
+
+在容器内部用 `wget` 调用 Admin API，不用关心每个容器映射到宿主机的哪个端口：
+
+```bash
+CTRS=$(podman ps --filter name=consumer-dispatcher --format '{{.Names}}')
+api()  { podman exec "$1" wget -qO- --header "$AUTH" "http://127.0.0.1:8888/api/jobs/$JOB$2"; }
+post() { podman exec "$1" wget -qO- --header "$AUTH" --post-data "$2" "http://127.0.0.1:8888/api/jobs/$JOB/$3"; }
+
+# 1. 记下每个容器当前的 worker 数
+for c in $CTRS; do echo "$c $(api "$c" | grep -o '"workers":[0-9]*')"; done
+
+# 2. 暂停所有容器
+for c in $CTRS; do post "$c" '{"count":0}' workers; echo " <- $c"; done
+
+# 3. 确认全部为 "workers":0
+for c in $CTRS; do echo "$c $(api "$c" | grep -o '"workers":[0-9]*')"; done
+
+# 4. 在任意一个容器上 purge 一次即可，返回 {"purged":N}
+post "$(echo "$CTRS" | head -1)" '{}' purge
+
+# 5. 恢复所有容器（改成第 1 步记下的 worker 数）
+for c in $CTRS; do post "$c" '{"count":2}' workers; echo " <- $c"; done
+```
+
+容器分布在**多台宿主机**上时，到每台机器上执行方法二的第 1–3、5 步（purge 只需执行一次）。也可以在运维机上直接用 `curl` 调各实例映射出来的端口：
+
+```bash
+INSTANCES="host1:8888 host1:8889 host2:8888"   # 每个实例的 Admin 地址
+for i in $INSTANCES; do curl -s -XPOST -H "$AUTH" -d '{"count":0}' "http://$i/api/jobs/$JOB/workers"; echo " <- $i"; done
+```
+
+注意：
+
+- 容器名过滤条件 `name=consumer-dispatcher` 换成实际的名字；也可以按 label 过滤，比如 `--filter label=app=consumer-dispatcher`。
+- 如果容器是用 systemd 或 Quadlet 管理的，方法一要用 `systemctl stop` / `systemctl start`，否则 systemd 可能会把 `podman stop` 掉的容器重新拉起来。
+- 如果容器配置了 `--restart` 策略，操作期间有容器重启的话，它会按配置文件里的 `count` 重新开始消费。purge 前再确认一遍所有容器的 `workers` 都是 0。
+
+#### 多副本（Kubernetes）
+
+**方法一：先缩容到 1 个副本**
 
 ```bash
 kubectl scale deployment/consumer-dispatcher --replicas=1
@@ -168,27 +222,18 @@ kubectl get pods -l app=consumer-dispatcher   # 等多余的 Pod 完全退出（
 kubectl scale deployment/consumer-dispatcher --replicas=<原副本数>
 ```
 
-**方法二：逐个 Pod 把 worker 设为 0**（不影响其他 job）
+**方法二：逐个 Pod 把 worker 设为 0**：和 Podman 的方法二一样，只是把容器列表和 exec 命令换成：
 
 ```bash
-PODS=$(kubectl get pods -l app=consumer-dispatcher -o name)
+CTRS=$(kubectl get pods -l app=consumer-dispatcher -o name)
+api()  { kubectl exec "$1" -- wget -qO- --header "$AUTH" "http://127.0.0.1:8888/api/jobs/$JOB$2"; }
 post() { kubectl exec "$1" -- wget -qO- --header "$AUTH" --post-data "$2" "http://127.0.0.1:8888/api/jobs/$JOB/$3"; }
-
-# 暂停所有 Pod
-for p in $PODS; do post "$p" '{"count":0}' workers; echo " <- $p"; done
-
-# 在任意一个 Pod 上 purge 一次即可
-post "$(echo "$PODS" | head -1)" '{}' purge
-
-# 恢复所有 Pod（改成原来的 worker 数）
-for p in $PODS; do post "$p" '{"count":2}' workers; echo " <- $p"; done
 ```
 
-注意：
+#### 通用说明
 
-- `app=consumer-dispatcher`、`deployment/consumer-dispatcher` 换成实际的 label 和 Deployment 名。镜像基于 alpine，自带 `wget`；如果启用了 Admin TLS，地址要改成 `https://`。
-- 如果操作期间有 Pod 重启或新扩出来，它会按配置文件里的 `count` 重新开始消费。purge 前再确认一遍所有 Pod 的 `workers` 都是 0。
-- 不用 K8s 部署时也一样：对每个实例的 Admin 地址分别调用 `/workers`。
+- 镜像基于 alpine，自带 `wget`。启用了 Admin TLS 时地址要改成 `https://`；如果用的是自签证书，还需要加 `--no-check-certificate`。
+- 示例里的 `8888` 是容器内的 Admin 端口（`admin.port`），如果改过要相应替换。
 
 ### 配置热加载
 
