@@ -2,9 +2,12 @@ package forward
 
 import (
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -63,6 +66,65 @@ func TestPost(t *testing.T) {
 				t.Errorf("host = %q, want %q", req.host, tt.host)
 			}
 		})
+	}
+}
+
+// Many jobs post to the same host concurrently; after a burst, every
+// connection must go back to the idle pool instead of being re-dialed.
+func TestConnectionsReusedUnderConcurrency(t *testing.T) {
+	const concurrency = 60 // above the previous per-host idle limit of 25
+
+	var newConns atomic.Int64
+	var mu sync.Mutex
+	var arrived int
+	release := make(chan struct{})
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Hold every request until all of the wave have arrived, so the
+		// client really has `concurrency` connections open at once.
+		mu.Lock()
+		arrived++
+		if arrived == concurrency {
+			close(release)
+		}
+		wait := release
+		mu.Unlock()
+		<-wait
+		_, _ = io.WriteString(w, "ok")
+	}))
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			newConns.Add(1)
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	c := New(5 * time.Second)
+	wave := func() {
+		mu.Lock()
+		arrived, release = 0, make(chan struct{})
+		mu.Unlock()
+		var wg sync.WaitGroup
+		for range concurrency {
+			wg.Go(func() {
+				if res := c.Post(t.Context(), srv.URL, "", "q", "b"); !res.OK {
+					t.Errorf("post: %+v", res)
+				}
+			})
+		}
+		wg.Wait()
+	}
+
+	wave()
+	if n := newConns.Load(); n != concurrency {
+		t.Fatalf("first wave opened %d connections, want %d", n, concurrency)
+	}
+	// The transport returns a connection to the pool on its read loop
+	// goroutine, shortly after the body is read; let that settle.
+	time.Sleep(100 * time.Millisecond)
+	wave()
+	if n := newConns.Load(); n != concurrency {
+		t.Fatalf("second wave opened %d new connections, want 0 (all reused)", n-concurrency)
 	}
 }
 

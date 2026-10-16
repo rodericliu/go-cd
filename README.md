@@ -52,6 +52,7 @@ job.xml 里没有鉴权和日志配置，生成的 YAML 会按示例配置补上
 - 支持 `${VAR}`、`${VAR:-default}` 展开（解析 YAML 后按字面替换标量值；裸 `$` 不展开；flow 风格 `{...}` / `[...]` 里需写成 `"${VAR}"`）
 - 密码等密钥放环境变量 / Secret，不要写进仓库
 - `retry_limit: 0` 表示不重试，`count: 0` 表示启动时不起 worker
+- 调用业务接口时会复用 HTTP 连接（每个目标主机最多保留 512 个空闲连接，空闲 60 秒后关闭）。下游 nginx/openresty 的 `keepalive_timeout` 需要**大于 60 秒**（默认 75 秒满足要求），否则偶尔会出现 `EOF` / `connection reset` 导致的投递失败
 - 日志文件：`log.file.path`（或环境变量 `LOG_FILE`）设置后写入该文件，目录不存在会自动创建，路径不可写时启动失败。按 `max_size_mb` 切割，保留 `max_backups` 个 / `max_age_days` 天，`compress` 控制旧文件 gzip。配置了文件时默认不再输出到终端，`log.stdout: true` 可同时输出。为空时只输出到 stdout
 - 日志：`log.level` 设置级别（debug/info/warn/error）。消息进 DLQ 时会打 `message dead-lettered`；`log.failed_body.enabled: true` 时，这条日志会附带 body（按 `max_bytes` 截断，按 `sample_rate` 采样）。默认不记录，因为 body 可能含敏感数据
 

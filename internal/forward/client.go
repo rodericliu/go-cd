@@ -11,7 +11,22 @@ import (
 	"time"
 )
 
-const maxResponseBytes = 1 << 20
+const (
+	maxResponseBytes = 1 << 20
+
+	// maxIdleConnsPerHost is high on purpose: many jobs usually post to the
+	// same consumer host through this shared client, so concurrency per host
+	// is the sum of their workers. Connections over the limit would be closed
+	// after every request and re-dialed. Idle connections only exist up to the
+	// concurrency actually reached and expire after idleConnTimeout, so a
+	// generous limit costs nothing when unused.
+	maxIdleConnsPerHost = 512
+	// idleConnTimeout must stay below the consumer's keep-alive timeout
+	// (nginx/openresty default 75s). Otherwise a POST may be sent on a
+	// connection the server is closing; POST is not retried by net/http, so
+	// it would fail.
+	idleConnTimeout = 60 * time.Second
+)
 
 // Client posts queue messages to HTTP consumers (legacy form contract).
 // Safe for concurrent use; create once and share.
@@ -26,9 +41,9 @@ func New(safetyTimeout time.Duration) *Client {
 	// Start from the default transport to keep proxy support, dial/TLS
 	// timeouts and HTTP/2, then tune pooling.
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.MaxIdleConns = 100
-	tr.MaxIdleConnsPerHost = 25
-	tr.IdleConnTimeout = 90 * time.Second
+	tr.MaxIdleConns = 0 // no global limit; see maxIdleConnsPerHost
+	tr.MaxIdleConnsPerHost = maxIdleConnsPerHost
+	tr.IdleConnTimeout = idleConnTimeout
 	c := &Client{http: &http.Client{Transport: tr}}
 	c.SetSafetyTimeout(safetyTimeout)
 	return c
