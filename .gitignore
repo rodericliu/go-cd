@@ -3,3 +3,4 @@ bin/
 configs/config.yaml
 *.exe
 .DS_Store
+*.swp
