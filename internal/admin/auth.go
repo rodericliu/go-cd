@@ -22,13 +22,15 @@ import (
 // /metrics stay open so Kubernetes and Prometheus need no credentials.
 const protectedPrefix = "/api/"
 
-// Options configure admin API authentication.
+// Options configure the admin server and its authentication.
 type Options struct {
 	// Tokens accepted as "Authorization: Bearer <token>". Empty disables token auth.
 	Tokens []string
 	// RequireClientCert requires a verified TLS client certificate on /api/*.
 	// The TLS listener must use tls.VerifyClientCertIfGiven (see TLSConfig).
 	RequireClientCert bool
+	// UI serves the web console at /ui/.
+	UI bool
 }
 
 type authenticator struct {

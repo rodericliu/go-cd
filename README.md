@@ -100,8 +100,8 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" localhost:8888/api/jobs
 | GET | `/readyz` | 就绪探针（含 AMQP ping） |
 | GET | `/metrics` | Prometheus |
 | POST | `/api/reload` | 重新加载配置文件（`?dry_run=true` 只预览），见下文 |
-| GET | `/api/jobs` | 任务列表 |
-| GET | `/api/jobs/{id}` | 任务详情（`name-server`；job 只绑定一个 server 时也可用 `name`） |
+| GET | `/api/jobs` | 任务列表（`?depth=true` 附带队列积压，见下文） |
+| GET | `/api/jobs/{id}` | 任务详情（`name-server`；job 只绑定一个 server 时也可用 `name`；同样支持 `?depth=true`） |
 | POST | `/api/jobs/{id}/workers` | `{"count":N}` 扩缩容（0–256） |
 | POST | `/api/jobs/{id}/url` | `{"url":"..."}` |
 | POST | `/api/jobs/{id}/block-patterns` | `{"patterns":"..."}` |
@@ -117,6 +117,32 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" localhost:8888/api/jobs
 `count` 取值 1–100，缺省 10。`{id}` 用多 server job 的裸 `name` 时返回 **409**，需改用 `name-server`。其他错误：404 不存在、400 参数非法、413 请求体超过 1 MiB。
 
 通过 Admin API 做的修改只保存在内存里，重启后恢复为配置文件的值。
+
+`?depth=true` 会向 RabbitMQ 查询主队列和 DLQ 的 ready 消息数与 consumer 数，结果放在每个 job 的 `depth` 字段：
+
+```json
+"depth": {"queue": {"messages": 120, "consumers": 2}, "dlq": {"messages": 3, "consumers": 0}}
+```
+
+查询有 3 秒超时。某个队列查不到时（队列不存在、连不上 broker、超时），对应项带 `error` 字段，其他 job 不受影响。不带参数时不查询 broker。
+
+### Web 控制台
+
+浏览器打开 `http://<admin 地址>/ui/`（访问 `/` 会跳转过去）。页面内置在二进制里，不需要单独部署，也不依赖外网。
+
+- **总览**：job 列表，显示 workers、队列积压、consumer 数、DLQ 数、completed/failed 累计值和速率；可按名称、队列、server、URL 筛选，自动刷新（2–30 秒可选，标签页在后台时暂停）。
+- **job 详情**：点击一行打开。可以调整 workers（含一键暂停）、修改 URL、block patterns、discard 开关；查看、取出主队列和 DLQ 消息，重放 DLQ，清空主队列或 DLQ；试投消息体。
+- **Reload 配置**：先 dry run 展示差异，确认后再应用。
+- 取出、重放、清空等操作需要二次确认；清空需要输入 job 名。
+- **中英文切换**：右上角按钮切换，选择保存在浏览器里；首次打开时按浏览器语言选择（中文环境用中文，其他用英文）。界面文案在 `internal/admin/ui/i18n.js`，新增文案时中英文都要加。
+
+页面本身是公开的静态文件，不含数据；数据都通过 `/api/*` 获取，鉴权规则不变：
+
+- 配置了 token 时，页面会弹框要求输入，token 只保存在当前标签页（sessionStorage），关闭标签页即失效。
+- 配置了 mTLS 时，需要把客户端证书导入浏览器。
+- 页面上的操作和 `curl` 调用一样会写审计日志。
+
+不需要控制台时设置 `admin.ui: false`（修改后需重启）。
 
 ### 清空队列（purge）
 

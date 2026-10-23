@@ -54,6 +54,9 @@ type Manager struct {
 	opts Options
 
 	reloadMu sync.Mutex // serializes Reload
+
+	inspectMu  sync.Mutex
+	inspecting map[string]bool // broker keys with a queue inspection in flight
 }
 
 // Options configure all pools created by a Manager.
@@ -68,6 +71,8 @@ func New(jobs []config.ResolvedJob, opts Options, log *slog.Logger) *Manager {
 		hub:    broker.NewHub(log),
 		client: forward.New(clientTimeout(jobs)),
 		log:    log,
+
+		inspecting: make(map[string]bool),
 	}
 	for _, j := range jobs {
 		m.pools[j.LogicName] = worker.NewPool(j, m.hub, m.client, opts, log)
@@ -168,6 +173,8 @@ type JobStatus struct {
 	DLQ              string `json:"dlq"`
 	BlockPatterns    string `json:"block_patterns"`
 	DiscardMatchJobs bool   `json:"discard_match_jobs"`
+	// Depth is only set when requested, since it queries the broker.
+	Depth *Depth `json:"depth,omitempty"`
 }
 
 func status(p *worker.Pool) JobStatus {

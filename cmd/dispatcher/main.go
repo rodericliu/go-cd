@@ -62,6 +62,7 @@ func run() int {
 	adminSrv := admin.New(mgr, admin.Options{
 		Tokens:            cfg.Admin.Tokens,
 		RequireClientCert: cfg.Admin.TLS.RequireClientCert(),
+		UI:                cfg.Admin.UIEnabled(),
 	}, log)
 	if !adminSrv.AuthEnabled() {
 		log.Warn("admin API has no authentication; set admin.tokens and/or admin.tls.client_ca_file")
@@ -90,7 +91,8 @@ func run() int {
 	errCh := make(chan error, 1)
 	go func() {
 		log.Info("admin listening", "addr", cfg.Admin.Addr(), "tls", tlsCfg != nil,
-			"token_auth", len(cfg.Admin.Tokens) > 0, "client_cert_auth", cfg.Admin.TLS.RequireClientCert())
+			"token_auth", len(cfg.Admin.Tokens) > 0, "client_cert_auth", cfg.Admin.TLS.RequireClientCert(),
+			"ui", cfg.Admin.UIEnabled())
 		var err error
 		if tlsCfg != nil {
 			err = srv.ListenAndServeTLS("", "") // certificates come from TLSConfig

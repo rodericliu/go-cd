@@ -68,7 +68,7 @@ func newTestReloader(t *testing.T) (*reloader, *fakeJobs, *[]string, string) {
 func TestReloaderAppliesSettings(t *testing.T) {
 	rl, jobs, tokens, path := newTestReloader(t)
 	writeFile(t, path, `
-admin: {port: 9999, tokens: [`+tokenNew+`]}
+admin: {port: 9999, ui: false, tokens: [`+tokenNew+`]}
 log:
   level: debug
   file: {path: /tmp/cd.log}
@@ -102,7 +102,7 @@ log:
 		if !slices.Equal(*tokens, []string{tokenNew}) || rl.level.Level() != slog.LevelDebug {
 			t.Fatalf("tokens=%v level=%v", *tokens, rl.level.Level())
 		}
-		if !slices.Equal(res.RestartRequired, []string{"admin.host/port", "log.file"}) {
+		if !slices.Equal(res.RestartRequired, []string{"admin.host/port", "admin.ui", "log.file"}) {
 			t.Fatalf("restart_required = %v", res.RestartRequired)
 		}
 	})
@@ -112,7 +112,7 @@ log:
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(res.Settings) != 0 || !slices.Equal(res.RestartRequired, []string{"admin.host/port", "log.file"}) {
+		if len(res.Settings) != 0 || !slices.Equal(res.RestartRequired, []string{"admin.host/port", "admin.ui", "log.file"}) {
 			t.Fatalf("settings=%v restart_required=%v", res.Settings, res.RestartRequired)
 		}
 	})

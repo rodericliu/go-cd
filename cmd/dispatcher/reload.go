@@ -67,6 +67,7 @@ func (r *reloader) reload(ctx context.Context, dryRun bool) (admin.ReloadResult,
 	// reported again on the next reload until the process restarts.
 	applied := *next
 	applied.Admin.Host, applied.Admin.Port, applied.Admin.TLS = r.cur.Admin.Host, r.cur.Admin.Port, r.cur.Admin.TLS
+	applied.Admin.UI = r.cur.Admin.UI
 	applied.Log.File, applied.Log.Stdout = r.cur.Log.File, r.cur.Log.Stdout
 	r.cur = &applied
 
@@ -98,6 +99,9 @@ func restartRequired(cur, next *config.File) []string {
 	}
 	if cur.Admin.TLS != next.Admin.TLS {
 		out = append(out, "admin.tls")
+	}
+	if cur.Admin.UIEnabled() != next.Admin.UIEnabled() {
+		out = append(out, "admin.ui")
 	}
 	if !sameLogFile(cur.Log.File, next.Log.File) {
 		out = append(out, "log.file")

@@ -25,6 +25,8 @@ admin:
   #   key_file: /etc/cd/tls/tls.key
   #   # 配置后 /api/* 必须携带此 CA 签发的客户端证书（与 token 同时配置时两者都要满足）
   #   client_ca_file: /etc/cd/tls/client-ca.crt
+  # Web 控制台 /ui/（默认开启）；页面调用 /api/*，鉴权与 API 相同。修改后需重启。
+  ui: true
 
 log:
   level: ${LOG_LEVEL:-info}   # debug | info | warn | error

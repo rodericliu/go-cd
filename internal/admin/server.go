@@ -20,6 +20,7 @@ import (
 const (
 	maxBodyBytes     = 1 << 20
 	readinessTimeout = 2 * time.Second
+	depthTimeout     = 3 * time.Second
 )
 
 // Server exposes REST admin + Prometheus metrics.
@@ -35,6 +36,9 @@ type Server struct {
 func New(mgr *manager.Manager, opts Options, log *slog.Logger) *Server {
 	s := &Server{mgr: mgr, log: log, mux: http.NewServeMux(), auth: newAuthenticator(opts, log)}
 	s.routes()
+	if opts.UI {
+		s.uiRoutes()
+	}
 	return s
 }
 
@@ -91,12 +95,36 @@ func (s *Server) readiness(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
-func (s *Server) listJobs(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.mgr.List())
+func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
+	depth, ok := queryBool(w, r, "depth")
+	if !ok {
+		return
+	}
+	if !depth {
+		writeJSON(w, http.StatusOK, s.mgr.List())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), depthTimeout)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mgr.ListWithDepth(ctx))
 }
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
-	j, err := s.mgr.Get(r.PathValue("id"))
+	depth, ok := queryBool(w, r, "depth")
+	if !ok {
+		return
+	}
+	var (
+		j   manager.JobStatus
+		err error
+	)
+	if depth {
+		ctx, cancel := context.WithTimeout(r.Context(), depthTimeout)
+		defer cancel()
+		j, err = s.mgr.GetWithDepth(ctx, r.PathValue("id"))
+	} else {
+		j, err = s.mgr.Get(r.PathValue("id"))
+	}
 	if err != nil {
 		writeMgrErr(w, err)
 		return
@@ -286,6 +314,20 @@ func queryCount(w http.ResponseWriter, r *http.Request) (int, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+// queryBool parses an optional boolean query parameter (missing means false).
+func queryBool(w http.ResponseWriter, r *http.Request, name string) (bool, bool) {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return false, true
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		http.Error(w, name+" must be true or false", http.StatusBadRequest)
+		return false, false
+	}
+	return v, true
 }
 
 func isClientErr(err error) bool {

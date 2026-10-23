@@ -45,6 +45,9 @@ func TestRoutes(t *testing.T) {
 		{name: "healthz", method: http.MethodGet, path: "/healthz", wantCode: http.StatusOK},
 		{name: "readyz before start", method: http.MethodGet, path: "/readyz", wantCode: http.StatusServiceUnavailable},
 		{name: "list", method: http.MethodGet, path: "/api/jobs", wantCode: http.StatusOK, wantBody: `"mail-a"`},
+		{name: "list bad depth", method: http.MethodGet, path: "/api/jobs?depth=maybe", wantCode: http.StatusBadRequest},
+		{name: "get bad depth", method: http.MethodGet, path: "/api/jobs/pay?depth=maybe", wantCode: http.StatusBadRequest},
+		{name: "get depth unknown", method: http.MethodGet, path: "/api/jobs/nope?depth=true", wantCode: http.StatusNotFound},
 		{name: "get by logic name", method: http.MethodGet, path: "/api/jobs/mail-b", wantCode: http.StatusOK, wantBody: `"mail-b"`},
 		{name: "get by unique name", method: http.MethodGet, path: "/api/jobs/pay", wantCode: http.StatusOK, wantBody: `"pay-a"`},
 		{name: "get ambiguous name", method: http.MethodGet, path: "/api/jobs/mail", wantCode: http.StatusConflict, wantBody: "mail-a, mail-b"},
@@ -98,6 +101,83 @@ func TestSetURLThenGet(t *testing.T) {
 	}
 	if got.URL != "https://new/d" {
 		t.Fatalf("url = %q", got.URL)
+	}
+}
+
+func TestListDepthUnreachableBroker(t *testing.T) {
+	h := newTestHandler(t)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/jobs?depth=true", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d; body: %s", rec.Code, rec.Body)
+	}
+	var got []manager.JobStatus
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d jobs, want 3", len(got))
+	}
+	for _, j := range got {
+		if j.Depth == nil || j.Depth.Queue.Error == "" || j.Depth.DLQ.Error == "" {
+			t.Fatalf("%s: depth = %+v, want errors for an unreachable broker", j.LogicName, j.Depth)
+		}
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/jobs", nil))
+	if strings.Contains(rec.Body.String(), `"depth"`) {
+		t.Fatalf("depth reported without ?depth=true: %s", rec.Body)
+	}
+}
+
+func TestUI(t *testing.T) {
+	const token = "ui-test-token-0123456789"
+	h := newTestHandlerWith(t, Options{Tokens: []string{token}, UI: true}, slog.New(slog.DiscardHandler))
+	tests := []struct {
+		name     string
+		path     string
+		wantCode int
+		wantType string
+		wantBody string
+	}{
+		{name: "index", path: "/ui/", wantCode: http.StatusOK, wantType: "text/html", wantBody: `src="app.js"`},
+		{name: "script", path: "/ui/app.js", wantCode: http.StatusOK, wantType: "javascript"},
+		{name: "i18n", path: "/ui/i18n.js", wantCode: http.StatusOK, wantType: "javascript"},
+		{name: "vendor", path: "/ui/vendor/htm-preact.mjs", wantCode: http.StatusOK, wantType: "javascript"},
+		{name: "style", path: "/ui/style.css", wantCode: http.StatusOK, wantType: "text/css"},
+		{name: "missing", path: "/ui/nope.js", wantCode: http.StatusNotFound},
+		{name: "root redirects", path: "/", wantCode: http.StatusFound},
+		{name: "api still protected", path: "/api/jobs", wantCode: http.StatusUnauthorized},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := serve(t, h, http.MethodGet, tt.path, "")
+			if rec.Code != tt.wantCode {
+				t.Fatalf("code = %d, want %d", rec.Code, tt.wantCode)
+			}
+			if tt.wantType != "" && !strings.Contains(rec.Header().Get("Content-Type"), tt.wantType) {
+				t.Fatalf("content-type = %q, want %q", rec.Header().Get("Content-Type"), tt.wantType)
+			}
+			if tt.wantBody != "" && !strings.Contains(rec.Body.String(), tt.wantBody) {
+				t.Fatalf("body does not contain %q", tt.wantBody)
+			}
+			if strings.HasPrefix(tt.path, "/ui/") && rec.Header().Get("Content-Security-Policy") != uiCSP {
+				t.Fatalf("missing CSP header")
+			}
+		})
+	}
+	if loc := serve(t, h, http.MethodGet, "/", "").Header().Get("Location"); loc != "/ui/" {
+		t.Fatalf("redirect location = %q", loc)
+	}
+}
+
+func TestUIDisabled(t *testing.T) {
+	h := newTestHandler(t)
+	for _, path := range []string{"/ui/", "/"} {
+		if rec := serve(t, h, http.MethodGet, path, ""); rec.Code != http.StatusNotFound {
+			t.Fatalf("%s: code = %d, want 404", path, rec.Code)
+		}
 	}
 }
 

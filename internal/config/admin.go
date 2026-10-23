@@ -30,7 +30,13 @@ type Admin struct {
 	// means the API is unauthenticated.
 	Tokens []string `yaml:"tokens"`
 	TLS    AdminTLS `yaml:"tls"`
+	// UI serves the web console at /ui/ (default true). The page itself holds
+	// no data; it calls /api/* with the same authentication.
+	UI *bool `yaml:"ui"`
 }
+
+// UIEnabled reports whether the web console is served.
+func (a Admin) UIEnabled() bool { return a.UI == nil || *a.UI }
 
 // AdminTLS enables HTTPS, and optionally client-certificate auth for /api/*.
 type AdminTLS struct {

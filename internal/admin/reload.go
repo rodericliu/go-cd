@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"strconv"
 
 	"consumer-dispatcher/internal/manager"
 )
@@ -34,14 +33,9 @@ func (s *Server) reload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "reload is not available", http.StatusNotImplemented)
 		return
 	}
-	dryRun := false
-	if raw := r.URL.Query().Get("dry_run"); raw != "" {
-		v, err := strconv.ParseBool(raw)
-		if err != nil {
-			http.Error(w, "dry_run must be true or false", http.StatusBadRequest)
-			return
-		}
-		dryRun = v
+	dryRun, ok := queryBool(w, r, "dry_run")
+	if !ok {
+		return
 	}
 	res, err := s.reloadFn(r.Context(), dryRun)
 	switch {
