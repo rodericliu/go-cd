@@ -63,6 +63,39 @@ func (p *Pool) SetWorkers(n int) {
 	p.resizeLocked(max(n, 0))
 }
 
+// Override scales the pool to n and turns autoscale off, so the autoscaler
+// does not undo a manual change. It reports whether autoscale was on.
+func (p *Pool) Override(n int) (paused bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return false
+	}
+	paused = p.job.Autoscale.Enabled
+	p.job.Autoscale.Enabled = false
+	p.resizeLocked(max(n, 0))
+	return paused
+}
+
+// Autoscale scales the pool to n only while autoscale is enabled, so it
+// cannot override a concurrent manual change. It reports whether it resized.
+func (p *Pool) Autoscale(n int) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed || !p.job.Autoscale.Enabled {
+		return false
+	}
+	p.resizeLocked(max(n, 0))
+	return true
+}
+
+// SetAutoscale replaces the autoscale settings. Workers keep running.
+func (p *Pool) SetAutoscale(a config.Autoscale) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.job.Autoscale = a
+}
+
 func (p *Pool) resizeLocked(n int) {
 	cur := len(p.workers)
 	switch {

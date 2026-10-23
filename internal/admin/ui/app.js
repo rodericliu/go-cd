@@ -219,7 +219,9 @@ function SettingsTab({ job, act }) {
   useEffect(() => setDiscard(job.discard_match_jobs), [job.discard_match_jobs]);
 
   const id = job.logic_name;
-  const setCount = (n) => act(t('settings.workersDone', { id, n }), () => api('POST', jobPath(id, '/workers'), { count: n }));
+  const auto = job.autoscale.enabled;
+  const setCount = (n) => act(auto ? t('settings.workersDoneAuto', { id, n }) : t('settings.workersDone', { id, n }),
+    () => api('POST', jobPath(id, '/workers'), { count: n }));
 
   return html`<div>
     <${Section} title="Workers">
@@ -229,10 +231,11 @@ function SettingsTab({ job, act }) {
         <button class="primary" onClick=${() => setCount(clampInt(workers, 0, MAX_WORKERS))}>${t('settings.set')}</button>
         ${job.workers > 0
           ? html`<button onClick=${() => setCount(0)}>${t('settings.pause')}</button>`
-          : html`<span class="badge warn">${t('badge.paused')}</span>`}
+          : !auto && html`<span class="badge warn">${t('badge.paused')}</span>`}
       </div>
-      <p class="hint">${t('settings.workersHint', { max: MAX_WORKERS })}</p>
+      <p class="hint">${t('settings.workersHint', { max: MAX_WORKERS })}${auto ? ' ' + t('settings.workersHintAuto') : ''}</p>
     <//>
+    <${AutoscaleSection} job=${job} act=${act} />
     <${Section} title="Consumer URL">
       <div class="row">
         <input value=${url} onInput=${(e) => setUrl(e.target.value)} class="grow" />
@@ -255,6 +258,53 @@ function SettingsTab({ job, act }) {
     <//>
     <p class="hint">${t('settings.memoryNote')}</p>
   </div>`;
+}
+
+const AUTOSCALE_FIELDS = [
+  ['min', 0, MAX_WORKERS],
+  ['max', 0, MAX_WORKERS],
+  ['messages_per_worker', 1, 1e9],
+  ['interval_seconds', 1, 86400],
+  ['scale_down_delay_seconds', 0, 86400],
+  ['max_step_up', 0, MAX_WORKERS],
+];
+
+function AutoscaleSection({ job, act }) {
+  const [form, setForm] = useState(job.autoscale);
+  // Resync when the job's settings change elsewhere (manual workers, reload).
+  const key = JSON.stringify(job.autoscale);
+  useEffect(() => setForm(job.autoscale), [key]);
+
+  const id = job.logic_name;
+  const set = (k, v) => setForm({ ...form, [k]: v });
+  const dirty = JSON.stringify(form) !== key;
+  const save = () => {
+    const body = { enabled: form.enabled, max_failure_ratio: Number(form.max_failure_ratio) };
+    for (const [k, lo, hi] of AUTOSCALE_FIELDS) body[k] = clampInt(form[k], lo, hi);
+    act(t('autoscale.done', { id }), () => api('POST', jobPath(id, '/autoscale'), body));
+  };
+
+  return html`<${Section} title="Autoscale">
+    <label class="check">
+      <input type="checkbox" checked=${form.enabled} onChange=${(e) => set('enabled', e.target.checked)} />
+      ${t('autoscale.enabled')}
+    </label>
+    <div class="row wrap">
+      ${AUTOSCALE_FIELDS.map(([k, lo, hi]) => html`<label key=${k} class="inline" title=${t('autoscale.help.' + k)}>
+        ${t('autoscale.' + k)}
+        <input type="number" min=${lo} max=${hi} value=${form[k]} onInput=${(e) => set(k, e.target.value)} class="narrow" />
+      </label>`)}
+      <label class="inline" title=${t('autoscale.help.max_failure_ratio')}>
+        ${t('autoscale.max_failure_ratio')}
+        <input type="number" min="0.01" max="1" step="0.05" value=${form.max_failure_ratio}
+          onInput=${(e) => set('max_failure_ratio', e.target.value)} class="narrow" />
+      </label>
+    </div>
+    <div class="row">
+      <button class="primary" disabled=${!dirty} onClick=${save}>${t('common.save')}</button>
+    </div>
+    <p class="hint">${t('autoscale.hint')}</p>
+  <//>`;
 }
 
 function MessageList({ result }) {
@@ -418,7 +468,8 @@ function JobsTable({ jobs, rates, selected, onSelect }) {
             <div class="name">${j.logic_name}</div>
             <div class="sub">
               ${j.queue}
-              ${j.workers === 0 && html` <span class="badge warn">${t('badge.paused')}</span>`}
+              ${j.workers === 0 && !j.autoscale.enabled && html` <span class="badge warn">${t('badge.paused')}</span>`}
+              ${j.autoscale.enabled && html` <span class="badge" title=${t('badge.autoTitle')}>${t('badge.auto', { min: j.autoscale.min, max: j.autoscale.max })}</span>`}
               ${j.block_patterns && html` <span class="badge" title=${j.block_patterns}>${j.discard_match_jobs ? t('badge.blockDiscard') : t('badge.block')}</span>`}
             </div>
           </td>

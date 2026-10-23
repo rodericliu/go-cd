@@ -25,6 +25,7 @@ func newTestHandlerWith(t *testing.T, opts Options, log *slog.Logger) http.Handl
 		return config.ResolvedJob{
 			Name: name, LogicName: name + "-" + server, ServerName: server, Server: srv,
 			Queue: name, DLQ: name + ".dlq", URL: "http://consumer/d", Timeout: time.Second,
+			Autoscale: config.DefaultAutoscale(),
 		}
 	}
 	mgr := manager.New([]config.ResolvedJob{job("mail", "a"), job("mail", "b"), job("pay", "a")}, manager.Options{}, log)
@@ -56,7 +57,12 @@ func TestRoutes(t *testing.T) {
 		{name: "workers missing count", method: http.MethodPost, path: "/api/jobs/pay/workers", body: `{}`, wantCode: http.StatusBadRequest},
 		{name: "workers out of range", method: http.MethodPost, path: "/api/jobs/pay/workers", body: `{"count":100000}`, wantCode: http.StatusBadRequest},
 		{name: "workers bad json", method: http.MethodPost, path: "/api/jobs/pay/workers", body: `{`, wantCode: http.StatusBadRequest},
-		{name: "workers zero", method: http.MethodPost, path: "/api/jobs/pay/workers", body: `{"count":0}`, wantCode: http.StatusOK},
+		{name: "workers zero", method: http.MethodPost, path: "/api/jobs/pay/workers", body: `{"count":0}`, wantCode: http.StatusOK, wantBody: `"autoscale_paused":false`},
+		{name: "autoscale enable without max", method: http.MethodPost, path: "/api/jobs/pay/autoscale", body: `{"enabled":true}`, wantCode: http.StatusBadRequest, wantBody: "autoscale.max"},
+		{name: "autoscale bad ratio", method: http.MethodPost, path: "/api/jobs/pay/autoscale", body: `{"max_failure_ratio":0}`, wantCode: http.StatusBadRequest},
+		{name: "autoscale unknown job", method: http.MethodPost, path: "/api/jobs/nope/autoscale", body: `{"enabled":false}`, wantCode: http.StatusNotFound},
+		{name: "autoscale bad json", method: http.MethodPost, path: "/api/jobs/pay/autoscale", body: `{`, wantCode: http.StatusBadRequest},
+		{name: "autoscale enable", method: http.MethodPost, path: "/api/jobs/mail-b/autoscale", body: `{"enabled":true,"min":0,"max":4}`, wantCode: http.StatusOK, wantBody: `"enabled":true`},
 		{name: "url invalid", method: http.MethodPost, path: "/api/jobs/pay/url", body: `{"url":"not a url"}`, wantCode: http.StatusBadRequest},
 		{name: "url empty", method: http.MethodPost, path: "/api/jobs/pay/url", body: `{}`, wantCode: http.StatusBadRequest},
 		{name: "patterns invalid", method: http.MethodPost, path: "/api/jobs/pay/block-patterns", body: `{"patterns":"("}`, wantCode: http.StatusBadRequest},

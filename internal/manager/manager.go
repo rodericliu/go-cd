@@ -23,7 +23,7 @@ import (
 
 const (
 	// MaxWorkers caps workers per job set through the admin API.
-	MaxWorkers = 256
+	MaxWorkers = config.MaxWorkers
 	// MaxPeek caps messages returned by one peek/take/dlq/replay call.
 	MaxPeek = 100
 
@@ -56,7 +56,11 @@ type Manager struct {
 	reloadMu sync.Mutex // serializes Reload
 
 	inspectMu  sync.Mutex
-	inspecting map[string]bool // broker keys with a queue inspection in flight
+	inspecting map[inspectKey]bool // servers with a queue inspection in flight
+
+	// readyFn reports each job's main queue stats to the autoscaler.
+	readyFn    func(context.Context, []config.ResolvedJob) []QueueStats
+	stopScaler func() // set by StartAll; stops and waits for the autoscaler
 }
 
 // Options configure all pools created by a Manager.
@@ -72,8 +76,9 @@ func New(jobs []config.ResolvedJob, opts Options, log *slog.Logger) *Manager {
 		client: forward.New(clientTimeout(jobs)),
 		log:    log,
 
-		inspecting: make(map[string]bool),
+		inspecting: make(map[inspectKey]bool),
 	}
+	m.readyFn = m.readyCounts
 	for _, j := range jobs {
 		m.pools[j.LogicName] = worker.NewPool(j, m.hub, m.client, opts, log)
 		m.file[j.LogicName] = j
@@ -111,13 +116,15 @@ func MaxJobTimeout(jobs []config.ResolvedJob) time.Duration {
 	return maxTimeout
 }
 
-// StartAll starts every pool with its configured worker count.
+// StartAll starts every pool with its configured worker count and the
+// autoscaler. Call it once.
 func (m *Manager) StartAll() {
 	for _, p := range m.snapshot() {
 		j := p.Job()
 		m.log.Info("starting job", "job", j.String())
-		p.SetWorkers(j.Count)
+		p.SetWorkers(j.InitialWorkers())
 	}
+	m.startAutoscaler()
 	m.ready.Store(true)
 }
 
@@ -128,6 +135,10 @@ func (m *Manager) StopAll(ctx context.Context) {
 	// Wait for a running reload so it cannot start pools after this point.
 	m.reloadMu.Lock()
 	defer m.reloadMu.Unlock()
+	if m.stopScaler != nil {
+		m.stopScaler()
+		m.stopScaler = nil
+	}
 	shutdownPools(ctx, m.snapshot())
 	m.hub.Close()
 }
@@ -160,19 +171,20 @@ func (m *Manager) Ping(ctx context.Context) error {
 
 // JobStatus is the admin view of one job.
 type JobStatus struct {
-	LogicName        string `json:"logic_name"`
-	Name             string `json:"name"`
-	Server           string `json:"server"`
-	Queue            string `json:"queue"`
-	URL              string `json:"url"`
-	Workers          int    `json:"workers"`
-	Completed        int64  `json:"completed"`
-	Failed           int64  `json:"failed"`
-	Prefetch         int    `json:"prefetch"`
-	RetryLimit       int    `json:"retry_limit"`
-	DLQ              string `json:"dlq"`
-	BlockPatterns    string `json:"block_patterns"`
-	DiscardMatchJobs bool   `json:"discard_match_jobs"`
+	LogicName        string          `json:"logic_name"`
+	Name             string          `json:"name"`
+	Server           string          `json:"server"`
+	Queue            string          `json:"queue"`
+	URL              string          `json:"url"`
+	Workers          int             `json:"workers"`
+	Completed        int64           `json:"completed"`
+	Failed           int64           `json:"failed"`
+	Prefetch         int             `json:"prefetch"`
+	RetryLimit       int             `json:"retry_limit"`
+	DLQ              string          `json:"dlq"`
+	BlockPatterns    string          `json:"block_patterns"`
+	DiscardMatchJobs bool            `json:"discard_match_jobs"`
+	Autoscale        AutoscaleStatus `json:"autoscale"`
 	// Depth is only set when requested, since it queries the broker.
 	Depth *Depth `json:"depth,omitempty"`
 }
@@ -194,6 +206,7 @@ func status(p *worker.Pool) JobStatus {
 		DLQ:              j.DLQ,
 		BlockPatterns:    j.BlockPatterns,
 		DiscardMatchJobs: j.DiscardMatchJobs,
+		Autoscale:        autoscaleStatus(j.Autoscale),
 	}
 }
 
@@ -242,17 +255,22 @@ func (m *Manager) pool(id string) (*worker.Pool, error) {
 	}
 }
 
-// SetWorkers scales a job to n workers (0..MaxWorkers).
-func (m *Manager) SetWorkers(id string, n int) error {
+// SetWorkers scales a job to n workers (0..MaxWorkers). A manual count takes
+// precedence over autoscale: it turns autoscale off for the job until it is
+// enabled again, and reports whether it did.
+func (m *Manager) SetWorkers(id string, n int) (autoscalePaused bool, err error) {
 	if n < 0 || n > MaxWorkers {
-		return fmt.Errorf("%w: count must be between 0 and %d", ErrInvalidArgument, MaxWorkers)
+		return false, fmt.Errorf("%w: count must be between 0 and %d", ErrInvalidArgument, MaxWorkers)
 	}
 	p, err := m.pool(id)
 	if err != nil {
-		return err
+		return false, err
 	}
-	p.SetWorkers(n)
-	return nil
+	if p.Override(n) {
+		m.log.Info("autoscale paused by manual workers change", "job", p.Job().LogicName, "workers", n)
+		return true, nil
+	}
+	return false, nil
 }
 
 // SetURL changes the consumer URL of a job.

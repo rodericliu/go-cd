@@ -17,6 +17,21 @@ import (
 // pile up goroutines.
 var errInspectBusy = errors.New("previous inspection of this server is still running")
 
+// inspector identifies who queries queue depths. Each one has its own
+// in-flight guard, so admin polling never makes the autoscaler skip a round.
+type inspector string
+
+const (
+	inspectAdmin     inspector = "admin"
+	inspectAutoscale inspector = "autoscale"
+)
+
+// inspectKey is a server being inspected by one inspector.
+type inspectKey struct {
+	by     inspector
+	server string // broker.Key
+}
+
 // QueueStats is the broker's view of one queue.
 type QueueStats struct {
 	Messages  int    `json:"messages"`
@@ -68,6 +83,26 @@ type inspectResult struct {
 }
 
 func (m *Manager) fillDepth(ctx context.Context, out []JobStatus, jobs []config.ResolvedJob) {
+	lookup := m.queueStats(ctx, inspectAdmin, jobs, func(j config.ResolvedJob) []string { return []string{j.Queue, j.DLQ} })
+	for i, j := range jobs {
+		out[i].Depth = &Depth{Queue: lookup(j, j.Queue), DLQ: lookup(j, j.DLQ)}
+	}
+}
+
+// readyCounts returns the stats of each job's main queue, in order.
+func (m *Manager) readyCounts(ctx context.Context, jobs []config.ResolvedJob) []QueueStats {
+	lookup := m.queueStats(ctx, inspectAutoscale, jobs, func(j config.ResolvedJob) []string { return []string{j.Queue} })
+	out := make([]QueueStats, len(jobs))
+	for i, j := range jobs {
+		out[i] = lookup(j, j.Queue)
+	}
+	return out
+}
+
+// queueStats inspects queues(j) of every job, one goroutine per server, and
+// returns a lookup by job and queue name. A server still being inspected by
+// the same inspector is reported busy rather than queried again.
+func (m *Manager) queueStats(ctx context.Context, by inspector, jobs []config.ResolvedJob, queues func(config.ResolvedJob) []string) func(config.ResolvedJob, string) QueueStats {
 	targets := make(map[string]*inspectTarget)
 	for _, j := range jobs {
 		key := broker.Key(j.ServerName, j.Server)
@@ -76,17 +111,18 @@ func (m *Manager) fillDepth(ctx context.Context, out []JobStatus, jobs []config.
 			t = &inspectTarget{name: j.ServerName, srv: j.Server}
 			targets[key] = t
 		}
-		t.queues = append(t.queues, j.Queue, j.DLQ)
+		t.queues = append(t.queues, queues(j)...)
 	}
 
 	results := make(chan inspectResult, len(targets))
 	for key, t := range targets {
-		if !m.beginInspect(key) {
+		ik := inspectKey{by: by, server: key}
+		if !m.beginInspect(ik) {
 			results <- inspectResult{key: key}
 			continue
 		}
 		go func() {
-			defer m.endInspect(key)
+			defer m.endInspect(ik)
 			results <- inspectResult{key: key, stats: m.inspect(t)}
 		}()
 	}
@@ -107,7 +143,8 @@ collect:
 		}
 	}
 
-	lookup := func(key, queue string) QueueStats {
+	return func(j config.ResolvedJob, queue string) QueueStats {
+		key := broker.Key(j.ServerName, j.Server)
 		if msg, ok := errs[key]; ok {
 			return QueueStats{Error: msg}
 		}
@@ -117,13 +154,9 @@ collect:
 		}
 		return byQueue[queue]
 	}
-	for i, j := range jobs {
-		key := broker.Key(j.ServerName, j.Server)
-		out[i].Depth = &Depth{Queue: lookup(key, j.Queue), DLQ: lookup(key, j.DLQ)}
-	}
 }
 
-func (m *Manager) beginInspect(key string) bool {
+func (m *Manager) beginInspect(key inspectKey) bool {
 	m.inspectMu.Lock()
 	defer m.inspectMu.Unlock()
 	if m.inspecting[key] {
@@ -133,7 +166,7 @@ func (m *Manager) beginInspect(key string) bool {
 	return true
 }
 
-func (m *Manager) endInspect(key string) {
+func (m *Manager) endInspect(key inspectKey) {
 	m.inspectMu.Lock()
 	defer m.inspectMu.Unlock()
 	delete(m.inspecting, key)

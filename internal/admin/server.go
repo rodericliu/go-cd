@@ -62,6 +62,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/jobs", s.listJobs)
 	s.mux.HandleFunc("GET /api/jobs/{id}", s.getJob)
 	s.mux.HandleFunc("POST /api/jobs/{id}/workers", s.setWorkers)
+	s.mux.HandleFunc("POST /api/jobs/{id}/autoscale", s.setAutoscale)
 	s.mux.HandleFunc("POST /api/jobs/{id}/url", s.setURL)
 	s.mux.HandleFunc("POST /api/jobs/{id}/block-patterns", s.setPatterns)
 	s.mux.HandleFunc("POST /api/jobs/{id}/discard-match", s.setDiscard)
@@ -143,11 +144,25 @@ func (s *Server) setWorkers(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "count required", http.StatusBadRequest)
 		return
 	}
-	if err := s.mgr.SetWorkers(r.PathValue("id"), *body.Count); err != nil {
+	paused, err := s.mgr.SetWorkers(r.PathValue("id"), *body.Count)
+	if err != nil {
 		writeMgrErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]int{"workers": *body.Count})
+	writeJSON(w, http.StatusOK, map[string]any{"workers": *body.Count, "autoscale_paused": paused})
+}
+
+func (s *Server) setAutoscale(w http.ResponseWriter, r *http.Request) {
+	var body manager.AutoscalePatch
+	if !decodeJSON(w, r, &body, false) {
+		return
+	}
+	a, err := s.mgr.SetAutoscale(r.PathValue("id"), body)
+	if err != nil {
+		writeMgrErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a)
 }
 
 func (s *Server) setURL(w http.ResponseWriter, r *http.Request) {

@@ -19,6 +19,8 @@ func TestClassify(t *testing.T) {
 	}{
 		{name: "same", mutate: func(*config.ResolvedJob) {}, want: unchanged},
 		{name: "count only", mutate: func(j *config.ResolvedJob) { j.Count = 5 }, want: scaled},
+		{name: "autoscale only", mutate: func(j *config.ResolvedJob) { j.Autoscale.Max = 8 }, want: scaled},
+		{name: "autoscale and url", mutate: func(j *config.ResolvedJob) { j.Autoscale.Max = 8; j.URL = "http://new/d" }, want: updated},
 		{name: "url", mutate: func(j *config.ResolvedJob) { j.URL = "http://new/d" }, want: updated},
 		{name: "timeout and count", mutate: func(j *config.ResolvedJob) { j.Timeout = time.Minute; j.Count = 3 }, want: updated},
 		{name: "block patterns", mutate: func(j *config.ResolvedJob) { j.BlockPatterns = "x" }, want: updated},
@@ -140,7 +142,7 @@ func TestReloadScales(t *testing.T) {
 	m.StartAll()
 
 	// A runtime scale is kept while the file count does not change...
-	if err := m.SetWorkers("mail-a", 3); err != nil {
+	if _, err := m.SetWorkers("mail-a", 3); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.Reload(t.Context(), testJobs(), Options{}, false); err != nil {
@@ -162,5 +164,60 @@ func TestReloadScales(t *testing.T) {
 	}
 	if j, _ := m.Get("mail-a"); j.Workers != 2 {
 		t.Fatalf("workers = %d, want 2", j.Workers)
+	}
+}
+
+func TestReloadAutoscale(t *testing.T) {
+	m := New(testJobs(), Options{}, slog.New(slog.DiscardHandler))
+	t.Cleanup(func() { m.StopAll(t.Context()) })
+	m.StartAll()
+
+	reload := func(jobs []config.ResolvedJob) {
+		t.Helper()
+		if _, err := m.Reload(t.Context(), jobs, Options{}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	get := func() JobStatus {
+		t.Helper()
+		j, err := m.Get("pay-a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return j
+	}
+
+	// Turned on in the file: settings applied, workers left to the autoscaler.
+	on := testJobs()
+	on[2].Count = 2
+	on[2].Autoscale = testAutoscale()
+	reload(on)
+	if j := get(); !j.Autoscale.Enabled || j.Autoscale.Max != 10 || j.Workers != 0 {
+		t.Fatalf("after enabling: %+v", j)
+	}
+
+	// Paused by a manual change; a file change to another autoscale field
+	// keeps it paused.
+	if _, err := m.SetWorkers("pay-a", 4); err != nil {
+		t.Fatal(err)
+	}
+	on2 := testJobs()
+	on2[2].Count = 2
+	on2[2].Autoscale = testAutoscale()
+	on2[2].Autoscale.Max = 20
+	reload(on2)
+	if j := get(); j.Autoscale.Enabled || j.Autoscale.Max != 20 || j.Workers != 4 {
+		t.Fatalf("after max change: %+v", j)
+	}
+
+	// Turned off in the file: back to count.
+	if _, err := m.SetAutoscale("pay-a", AutoscalePatch{Enabled: new(true)}); err != nil {
+		t.Fatal(err)
+	}
+	off := testJobs()
+	off[2].Count = 2
+	reload(off)
+	if j := get(); j.Autoscale.Enabled || j.Workers != 2 {
+		t.Fatalf("after disabling: %+v", j)
 	}
 }

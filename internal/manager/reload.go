@@ -27,7 +27,7 @@ type JobChanges struct {
 	// Updated jobs changed runtime settings (url, timeout, retry_limit, ...);
 	// their workers are replaced gracefully.
 	Updated []string `json:"updated"`
-	// Scaled jobs only changed count.
+	// Scaled jobs only changed count and/or autoscale; workers keep running.
 	Scaled []string `json:"scaled"`
 	// Recreated jobs changed queue, topology or server and are rebuilt from
 	// the file; changes made through the admin API are dropped.
@@ -61,7 +61,7 @@ func classify(old, cur config.ResolvedJob) changeKind {
 		return recreated
 	}
 	o = old
-	o.Count = cur.Count
+	o.Count, o.Autoscale = cur.Count, cur.Autoscale
 	if o == cur {
 		return scaled
 	}
@@ -80,11 +80,12 @@ func copyRuntime(dst *config.ResolvedJob, src config.ResolvedJob) {
 	dst.Prefetch = src.Prefetch
 	dst.BlockPatterns = src.BlockPatterns
 	dst.DiscardMatchJobs = src.DiscardMatchJobs
+	dst.Autoscale = src.Autoscale
 }
 
 // applyFileChanges sets on dst only the runtime settings that changed in the
-// file between old and cur, keeping admin API changes to the others. Count is
-// handled separately because it is applied by scaling.
+// file between old and cur, keeping admin API changes to the others. Count and
+// autoscale are handled separately because they do not replace workers.
 func applyFileChanges(dst *config.ResolvedJob, old, cur config.ResolvedJob) {
 	if old.URL != cur.URL {
 		dst.URL = cur.URL
@@ -110,6 +111,33 @@ func applyFileChanges(dst *config.ResolvedJob, old, cur config.ResolvedJob) {
 	if old.DiscardMatchJobs != cur.DiscardMatchJobs {
 		dst.DiscardMatchJobs = cur.DiscardMatchJobs
 	}
+}
+
+// mergeAutoscale is applyFileChanges for autoscale: it returns runtime with
+// only the fields that changed in the file between old and cur replaced.
+func mergeAutoscale(runtime, old, cur config.Autoscale) config.Autoscale {
+	set := func(dst *int, o, c int) {
+		if o != c {
+			*dst = c
+		}
+	}
+	if old.Enabled != cur.Enabled {
+		runtime.Enabled = cur.Enabled
+	}
+	set(&runtime.Min, old.Min, cur.Min)
+	set(&runtime.Max, old.Max, cur.Max)
+	set(&runtime.MessagesPerWorker, old.MessagesPerWorker, cur.MessagesPerWorker)
+	set(&runtime.MaxStepUp, old.MaxStepUp, cur.MaxStepUp)
+	if old.Interval != cur.Interval {
+		runtime.Interval = cur.Interval
+	}
+	if old.ScaleDownDelay != cur.ScaleDownDelay {
+		runtime.ScaleDownDelay = cur.ScaleDownDelay
+	}
+	if old.MaxFailureRatio != cur.MaxFailureRatio {
+		runtime.MaxFailureRatio = cur.MaxFailureRatio
+	}
+	return runtime
 }
 
 func sameOptions(a, b Options) bool {
@@ -211,15 +239,29 @@ func (m *Manager) Reload(ctx context.Context, jobs []config.ResolvedJob, opts Op
 		if optsChanged {
 			pool.UpdateOptions(opts)
 		}
-		switch p.kinds[name] {
-		case updated:
-			old := m.file[name]
+		k := p.kinds[name]
+		if k != updated && k != scaled {
+			continue
+		}
+		old := m.file[name]
+		if k == updated {
 			pool.UpdateJob(func(j *config.ResolvedJob) { applyFileChanges(j, old, cur) })
 			m.log.Info("reload: job updated", "job", cur.String())
-		case scaled:
-			m.log.Info("reload: job scaled", "job", name, "workers", cur.Count)
+		} else {
+			m.log.Info("reload: job scaled", "job", name, "workers", cur.InitialWorkers(), "autoscale", cur.Autoscale.Enabled)
 		}
-		if k := p.kinds[name]; (k == updated || k == scaled) && m.file[name].Count != cur.Count {
+		if old.Autoscale != cur.Autoscale {
+			a := mergeAutoscale(pool.Job().Autoscale, old.Autoscale, cur.Autoscale)
+			if err := a.Validate(); err != nil {
+				m.log.Warn("reload: admin autoscale changes conflict with the file, using the file", "job", name, "err", err)
+				a = cur.Autoscale
+			}
+			pool.SetAutoscale(a)
+		}
+		// While autoscale runs it owns the worker count. Turning it off in
+		// the file returns the job to count.
+		turnedOff := old.Autoscale.Enabled && !cur.Autoscale.Enabled
+		if !pool.Job().Autoscale.Enabled && (old.Count != cur.Count || turnedOff) {
 			pool.SetWorkers(cur.Count)
 		}
 	}
@@ -234,7 +276,7 @@ func (m *Manager) Reload(ctx context.Context, jobs []config.ResolvedJob, opts Op
 	for _, j := range start {
 		pool := worker.NewPool(j, m.hub, m.client, opts, m.log)
 		m.pools[j.LogicName] = pool
-		pool.SetWorkers(j.Count)
+		pool.SetWorkers(j.InitialWorkers())
 		m.log.Info("reload: job started", "job", j.String())
 	}
 	m.mu.Unlock()

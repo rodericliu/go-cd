@@ -167,6 +167,7 @@
 | F-12 | 失败日志可选记录 body（采样 / 截断） | P1 | 已完成：`log.failed_body`（默认关闭，`max_bytes` 截断、`sample_rate` 采样）；`log.level` 可配置 |
 | F-13 | 多副本协调 purge（原 ZK 主从诉求的现代替代） | P2 | **不做**（决策）：purge 需求很少；队列由 RabbitMQ 共享，任一副本 purge 即全局生效，缺的只是"先暂停所有副本"，用运维流程（缩容到 1 个副本或逐个 Pod 把 worker 设为 0）即可解决，不值得引入跨副本广播 / 确认的复杂度。操作流程见 README「清空队列（purge）」 |
 | F-14 | 配置热加载 | P2 | 已完成：`POST /api/reload`（支持 `dry_run`）与 SIGHUP；校验失败保持旧配置；按 job 增 / 删 / 更新 / 扩缩容 / 重建，Admin API 的临时修改仅在文件同一项变化时被覆盖；监听地址、TLS、日志输出需重启 |
+| F-15 | 按队列积压自动调整 worker 数 | P2 | 已完成：job 级 `autoscale`（`min`/`max`/`messages_per_worker` 等，可继承 `defaults.autoscale`），只按主队列 ready 数计算；扩容立即、缩容按 `scale_down_delay_seconds` 取窗口峰值；周期内 DLQ 比例超过 `max_failure_ratio` 时暂停扩容（下游保护）；各副本独立计算，`min`/`max` 按单副本；手动设置 workers 会暂停 autoscale，通过 `POST /api/jobs/{id}/autoscale` 重新开启或调整 |
 
 ---
 

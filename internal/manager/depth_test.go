@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"consumer-dispatcher/internal/broker"
+	"consumer-dispatcher/internal/config"
 )
 
 func TestListWithDepthUnreachable(t *testing.T) {
@@ -23,7 +24,7 @@ func TestListWithDepthUnreachable(t *testing.T) {
 func TestDepthSkipsServerBeingInspected(t *testing.T) {
 	m := newTestManager(t)
 	job := testJobs()[2] // pay-a
-	key := broker.Key(job.ServerName, job.Server)
+	key := inspectKey{by: inspectAdmin, server: broker.Key(job.ServerName, job.Server)}
 	if !m.beginInspect(key) {
 		t.Fatal("beginInspect on idle server = false")
 	}
@@ -42,5 +43,39 @@ func TestDepthSkipsServerBeingInspected(t *testing.T) {
 	got, _ = m.GetWithDepth(ctx, "mail-b") // other server: not busy, but ctx is done
 	if got.Depth == nil || got.Depth.Queue.Error == "" {
 		t.Fatalf("depth = %+v, want error", got.Depth)
+	}
+}
+
+// An admin inspection in flight must not make the autoscaler skip a round,
+// and vice versa; each is only guarded against its own pile-up.
+func TestInspectorsDoNotBlockEachOther(t *testing.T) {
+	m := newTestManager(t)
+	job := testJobs()[2] // pay-a
+	server := broker.Key(job.ServerName, job.Server)
+
+	admin := inspectKey{by: inspectAdmin, server: server}
+	if !m.beginInspect(admin) {
+		t.Fatal("beginInspect admin = false")
+	}
+	got := m.readyCounts(t.Context(), []config.ResolvedJob{job})
+	if got[0].Error == "" || got[0].Error == errInspectBusy.Error() {
+		t.Fatalf("autoscale query during admin inspection: %+v, want a broker error", got[0])
+	}
+	m.endInspect(admin)
+
+	auto := inspectKey{by: inspectAutoscale, server: server}
+	if !m.beginInspect(auto) {
+		t.Fatal("beginInspect autoscale = false")
+	}
+	defer m.endInspect(auto)
+	if got := m.readyCounts(t.Context(), []config.ResolvedJob{job}); got[0].Error != errInspectBusy.Error() {
+		t.Fatalf("second autoscale query = %+v, want busy", got[0])
+	}
+	st, err := m.GetWithDepth(t.Context(), "pay-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Depth.Queue.Error == errInspectBusy.Error() {
+		t.Fatal("admin query blocked by autoscale inspection")
 	}
 }

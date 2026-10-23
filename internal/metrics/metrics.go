@@ -22,6 +22,16 @@ var (
 		Help: "Active workers per job",
 	}, []string{"job"})
 
+	QueueReady = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "cd_queue_ready_messages",
+		Help: "Ready messages in the job queue, as last seen by the autoscaler",
+	}, []string{"job"})
+
+	AutoscaleDesired = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "cd_autoscale_desired_workers",
+		Help: "Workers the autoscaler computed from the backlog, within min/max",
+	}, []string{"job"})
+
 	InFlight = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "cd_inflight_jobs",
 		Help: "Messages currently being processed",

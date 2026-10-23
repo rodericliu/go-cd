@@ -15,6 +15,7 @@ func testJobs() []config.ResolvedJob {
 		return config.ResolvedJob{
 			Name: name, LogicName: name + "-" + server, ServerName: server, Server: srv,
 			Queue: name, DLQ: name + ".dlq", URL: "http://consumer/d", Timeout: time.Second,
+			Autoscale: config.DefaultAutoscale(),
 		}
 	}
 	return []config.ResolvedJob{job("mail", "a"), job("mail", "b"), job("pay", "a")}
@@ -65,8 +66,8 @@ func TestAdminInputValidation(t *testing.T) {
 		name string
 		call func() error
 	}{
-		{"workers negative", func() error { return m.SetWorkers("pay", -1) }},
-		{"workers too many", func() error { return m.SetWorkers("pay", MaxWorkers+1) }},
+		{"workers negative", func() error { _, err := m.SetWorkers("pay", -1); return err }},
+		{"workers too many", func() error { _, err := m.SetWorkers("pay", MaxWorkers+1); return err }},
 		{"url relative", func() error { return m.SetURL("pay", "/dispatch") }},
 		{"url bad scheme", func() error { return m.SetURL("pay", "ftp://x/d") }},
 		{"bad regexp", func() error { return m.SetBlockPatterns("pay", "(") }},
@@ -88,7 +89,7 @@ func TestAdminInputValidation(t *testing.T) {
 
 func TestSetWorkersAndUpdates(t *testing.T) {
 	m := newTestManager(t)
-	if err := m.SetWorkers("mail-b", 3); err != nil {
+	if _, err := m.SetWorkers("mail-b", 3); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.SetURL("mail-b", "https://new.example/d"); err != nil {
@@ -102,7 +103,7 @@ func TestSetWorkersAndUpdates(t *testing.T) {
 	if a.Workers != 0 || a.URL != "http://consumer/d" {
 		t.Fatalf("mail-a was modified: %+v", a)
 	}
-	if err := m.SetWorkers("mail", 1); !errors.Is(err, ErrAmbiguousJob) {
+	if _, err := m.SetWorkers("mail", 1); !errors.Is(err, ErrAmbiguousJob) {
 		t.Fatalf("err = %v, want ErrAmbiguousJob", err)
 	}
 }

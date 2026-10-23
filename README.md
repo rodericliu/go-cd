@@ -73,6 +73,51 @@ job.xml 里没有鉴权和日志配置，生成的 YAML 会按示例配置补上
   queue: text_mail
 ```
 
+### 按积压自动扩缩容（autoscale）
+
+默认 worker 数固定为 `count`。开启 autoscale 后，程序定时查询主队列的 ready 消息数，自动调整 worker 数：
+
+```yaml
+defaults:
+  autoscale:                      # 所有 job 共用的默认值，job 里可逐项覆盖
+    max: 16
+jobs:
+  - name: pay
+    server: site_a
+    count: 2                      # 开启 autoscale 时只作为启动时的数量（会被限制在 min–max 之间）
+    autoscale:
+      enabled: true
+      min: 1                      # 下限，可以为 0（没有积压时不消费，有消息时再起 worker）
+      max: 32                     # 上限（开启时必填，≤ 256）
+      messages_per_worker: 100    # 目标 worker 数 = ceil(ready / 100)，再限制在 min–max 之间
+      interval_seconds: 10        # 检查间隔
+      scale_down_delay_seconds: 120  # 缩容延迟
+      max_step_up: 0              # 每次最多加几个，0 表示不限
+      max_failure_ratio: 0.5      # 下游保护，见下文
+```
+
+| 字段 | 缺省 |
+|------|------|
+| `enabled` | `false` |
+| `min` | `1` |
+| `max` | 无（开启时必填） |
+| `messages_per_worker` | `100` |
+| `interval_seconds` | `10` |
+| `scale_down_delay_seconds` | `120` |
+| `max_step_up` | `0`（不限） |
+| `max_failure_ratio` | `0.5` |
+
+规则：
+
+- **扩容立即生效**：算出的目标值比当前多，就马上加（受 `max_step_up` 限制）。
+- **缩容有延迟**：只有积压持续变少 `scale_down_delay_seconds` 秒后才缩，并且只缩到这段时间内目标值的最大值，避免积压一波一波时 worker 来回增减。缩容时每个 worker 会先处理完手上的消息。
+- **下游保护**：一个检查周期内处理完的消息里，进入 DLQ 的比例超过 `max_failure_ratio`（并且至少有 20 条），就**暂停扩容**，同时打 Warn 日志 `scale-up held`。这时积压通常是因为下游接口慢或报错，再加 worker 只会让下游压力更大、更多消息进入 DLQ。比例降下来后自动恢复扩容，缩容不受影响。`1` 表示不检查。
+- **查不到队列深度时**（broker 断开、超时）保持当前数量不变。
+- **只看 ready 消息**：已经预取给 worker、还没 ack 的消息不算在内。`prefetch` 设得很大时积压会被低估。
+- **多副本各自计算**：每个副本看到的是同一个队列，会各自按积压扩容，所以 `min`/`max` 是**单个副本**的值。总 worker 数最多是 副本数 × `max`，设置 `max` 时要考虑下游的承受能力。
+- **手动调整优先**：通过 `/workers` 接口或控制台手动设置 worker 数，会**暂停**该 job 的 autoscale（返回 `"autoscale_paused":true`），之后不会被自动改回。需要用 `/autoscale` 接口（或控制台）重新开启。
+- 指标：`cd_queue_ready_messages{job}`（最近一次查到的积压）、`cd_autoscale_desired_workers{job}`（算出的目标值），实际数量看 `cd_workers{job}`。扩缩容时打 Info 日志 `autoscale`，包含 `from`、`to`、`ready`、`reason`。
+
 HTTP 表单字段：`queueName`（job name）、`bodyData`（消息体）。
 
 失败重试耗尽后写入 DLQ（publisher confirm 确认后），再 ack 原消息（不再用 Redis 存失败任务）。停机时先等处理中的消息完成；超过 15s 则中断并放回原队列，不会进 DLQ。
@@ -102,7 +147,8 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" localhost:8888/api/jobs
 | POST | `/api/reload` | 重新加载配置文件（`?dry_run=true` 只预览），见下文 |
 | GET | `/api/jobs` | 任务列表（`?depth=true` 附带队列积压，见下文） |
 | GET | `/api/jobs/{id}` | 任务详情（`name-server`；job 只绑定一个 server 时也可用 `name`；同样支持 `?depth=true`） |
-| POST | `/api/jobs/{id}/workers` | `{"count":N}` 扩缩容（0–256） |
+| POST | `/api/jobs/{id}/workers` | `{"count":N}` 扩缩容（0–256）；开启了 autoscale 时会暂停它 |
+| POST | `/api/jobs/{id}/autoscale` | 修改 autoscale，只传要改的字段，如 `{"enabled":true}`、`{"min":0,"max":8}`；返回修改后的完整设置。关闭时 worker 数保持当前值 |
 | POST | `/api/jobs/{id}/url` | `{"url":"..."}` |
 | POST | `/api/jobs/{id}/block-patterns` | `{"patterns":"..."}` |
 | POST | `/api/jobs/{id}/discard-match` | `{"discard":true}` |
@@ -180,6 +226,9 @@ curl -s -XPOST -H "$AUTH" "$API/purge"
 
 # 5. 恢复消费：改回第 1 步记下的 worker 数
 curl -s -XPOST -H "$AUTH" -d '{"count":2}' "$API/workers"
+#    如果这个 job 开启了 autoscale（第 1 步结果里 "autoscale":{"enabled":true,...}），
+#    第 2 步会暂停 autoscale，这一步改为重新开启：
+curl -s -XPOST -H "$AUTH" -d '{"enabled":true}' "$API/autoscale"
 ```
 
 #### 多副本（Podman 多容器）
@@ -223,6 +272,8 @@ post "$(echo "$CTRS" | head -1)" '{}' purge
 
 # 5. 恢复所有容器（改成第 1 步记下的 worker 数）
 for c in $CTRS; do post "$c" '{"count":2}' workers; echo " <- $c"; done
+#    开启了 autoscale 的 job 改为重新开启 autoscale：
+for c in $CTRS; do post "$c" '{"enabled":true}' autoscale; echo " <- $c"; done
 ```
 
 容器分布在**多台宿主机**上时，到每台机器上执行方法二的第 1–3、5 步（purge 只需执行一次）。也可以在运维机上直接用 `curl` 调各实例映射出来的端口：
@@ -236,7 +287,7 @@ for i in $INSTANCES; do curl -s -XPOST -H "$AUTH" -d '{"count":0}' "http://$i/ap
 
 - 容器名过滤条件 `name=consumer-dispatcher` 换成实际的名字；也可以按 label 过滤，比如 `--filter label=app=consumer-dispatcher`。
 - 如果容器是用 systemd 或 Quadlet 管理的，方法一要用 `systemctl stop` / `systemctl start`，否则 systemd 可能会把 `podman stop` 掉的容器重新拉起来。
-- 如果容器配置了 `--restart` 策略，操作期间有容器重启的话，它会按配置文件里的 `count` 重新开始消费。purge 前再确认一遍所有容器的 `workers` 都是 0。
+- 如果容器配置了 `--restart` 策略，操作期间有容器重启的话，它会按配置文件里的 `count` 重新开始消费（开启了 autoscale 的 job 还会重新开启 autoscale）。purge 前再确认一遍所有容器的 `workers` 都是 0。
 
 #### 多副本（Kubernetes）
 
@@ -279,7 +330,7 @@ kill -HUP <pid>                                                                 
 |------|------|
 | 新增 job | 创建并开始消费 |
 | 删除 job | 处理完手上的消息后停止（最多等 15 秒，超时的消息退回队列） |
-| 只改了 `count` | 直接扩缩容 |
+| 只改了 `count` 和/或 `autoscale` | 直接扩缩容，不替换 worker。开启 autoscale 时 worker 数由它决定，`count` 不生效；在文件里关闭 autoscale 后恢复为 `count` |
 | 改了 `url`、`url_host`、`timeout_ms`、`retry_limit`、`prefetch`、`block_patterns`、`discard_match_jobs`、`encoding` | 平滑替换 worker |
 | 改了队列、exchange、路由、durable、`declare_topology` 或 server 连接参数 | 停掉后按新配置重建 |
 

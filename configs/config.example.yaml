@@ -11,6 +11,16 @@ defaults:
   prefetch: 10
   # declare exchange/queue/dlq on start; set false if topology is managed elsewhere
   declare_topology: true
+  # 按队列积压自动调整 worker 数（README「按积压自动扩缩容」）；job 里可逐项覆盖
+  # autoscale:
+  #   enabled: false
+  #   min: 1
+  #   max: 16                    # 开启时必填，按单个副本计算
+  #   messages_per_worker: 100   # 目标 worker 数 = ceil(ready / 100)
+  #   interval_seconds: 10
+  #   scale_down_delay_seconds: 120
+  #   max_step_up: 0             # 每次最多加几个，0 不限
+  #   max_failure_ratio: 0.5     # 周期内进 DLQ 的比例超过它时不再扩容，1 不检查
 
 admin:
   host: "0.0.0.0"
@@ -78,6 +88,7 @@ jobs:
     # block_patterns: "bad-payload"
     # discard_match_jobs: true
     # dlq: text_mail.dlq
+    # autoscale: {enabled: true, min: 1, max: 8}   # 开启后 count 只作为启动时的数量
 
   - name: bounce_mail
     server: site_a

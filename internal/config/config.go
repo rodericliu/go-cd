@@ -37,6 +37,8 @@ type Defaults struct {
 	RetryLimit      *int   `yaml:"retry_limit"`
 	Prefetch        int    `yaml:"prefetch"`
 	DeclareTopology *bool  `yaml:"declare_topology"`
+
+	Autoscale AutoscaleFile `yaml:"autoscale"`
 }
 
 type Server struct {
@@ -68,6 +70,8 @@ type Job struct {
 	QueueDurable     *bool      `yaml:"queue_durable"`
 	DeclareTopology  *bool      `yaml:"declare_topology"`
 	DLQ              string     `yaml:"dlq"` // empty => queue + ".dlq"
+
+	Autoscale AutoscaleFile `yaml:"autoscale"`
 }
 
 // StringList unmarshals a YAML string or sequence of strings.
@@ -130,6 +134,7 @@ type ResolvedJob struct {
 	QueueDurable     bool
 	DeclareTopology  bool
 	DLQ              string
+	Autoscale        Autoscale
 }
 
 // Only ${VAR} and ${VAR:-default} are expanded; a bare "$" is kept literally
@@ -270,6 +275,7 @@ func resolveJobs(cfg *File) ([]ResolvedJob, error) {
 				QueueDurable:     boolOrDefault(j.QueueDurable, true),
 				DeclareTopology:  declare,
 				DLQ:              firstNonEmpty(j.DLQ, firstNonEmpty(j.Queue, j.Name)+".dlq"),
+				Autoscale:        resolveAutoscale(j.Autoscale, cfg.Defaults.Autoscale),
 			}
 			if err := validateJob(rj); err != nil {
 				return nil, fmt.Errorf("job %q: %w", j.Name, err)
@@ -303,7 +309,7 @@ func validateJob(j ResolvedJob) error {
 	if j.RetryLimit < 0 {
 		return errors.New("retry_limit must be >= 0")
 	}
-	return nil
+	return j.Autoscale.Validate()
 }
 
 // ValidateURL reports whether raw is an absolute http(s) URL with a host.
@@ -396,6 +402,10 @@ func boolOrDefault(p *bool, def bool) bool {
 }
 
 func (j ResolvedJob) String() string {
-	return fmt.Sprintf("job=%s server=%s queue=%s url=%s workers=%d timeout=%s retry=%d prefetch=%d",
-		j.LogicName, j.ServerName, j.Queue, j.URL, j.Count, j.Timeout, j.RetryLimit, j.Prefetch)
+	s := fmt.Sprintf("job=%s server=%s queue=%s url=%s workers=%d timeout=%s retry=%d prefetch=%d",
+		j.LogicName, j.ServerName, j.Queue, j.URL, j.InitialWorkers(), j.Timeout, j.RetryLimit, j.Prefetch)
+	if a := j.Autoscale; a.Enabled {
+		s += fmt.Sprintf(" autoscale=%d-%d", a.Min, a.Max)
+	}
+	return s
 }
