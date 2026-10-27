@@ -182,6 +182,7 @@ type JobStatus struct {
 	Prefetch         int             `json:"prefetch"`
 	RetryLimit       int             `json:"retry_limit"`
 	DLQ              string          `json:"dlq"`
+	DLQTTLDays       int             `json:"dlq_ttl_days"`
 	BlockPatterns    string          `json:"block_patterns"`
 	DiscardMatchJobs bool            `json:"discard_match_jobs"`
 	Autoscale        AutoscaleStatus `json:"autoscale"`
@@ -204,6 +205,7 @@ func status(p *worker.Pool) JobStatus {
 		Prefetch:         j.Prefetch,
 		RetryLimit:       j.RetryLimit,
 		DLQ:              j.DLQ,
+		DLQTTLDays:       int(j.DLQTTL / (24 * time.Hour)),
 		BlockPatterns:    j.BlockPatterns,
 		DiscardMatchJobs: j.DiscardMatchJobs,
 		Autoscale:        autoscaleStatus(j.Autoscale),

@@ -15,6 +15,7 @@ import (
 const (
 	defaultCount      = 1
 	defaultRetryLimit = 1
+	defaultDLQTTLDays = 7
 )
 
 // File is the root YAML configuration.
@@ -37,6 +38,7 @@ type Defaults struct {
 	RetryLimit      *int   `yaml:"retry_limit"`
 	Prefetch        int    `yaml:"prefetch"`
 	DeclareTopology *bool  `yaml:"declare_topology"`
+	DLQTTLDays      *int   `yaml:"dlq_ttl_days"` // 0 => DLQ messages never expire
 
 	Autoscale AutoscaleFile `yaml:"autoscale"`
 }
@@ -70,6 +72,7 @@ type Job struct {
 	QueueDurable     *bool      `yaml:"queue_durable"`
 	DeclareTopology  *bool      `yaml:"declare_topology"`
 	DLQ              string     `yaml:"dlq"` // empty => queue + ".dlq"
+	DLQTTLDays       *int       `yaml:"dlq_ttl_days"`
 
 	Autoscale AutoscaleFile `yaml:"autoscale"`
 }
@@ -134,6 +137,7 @@ type ResolvedJob struct {
 	QueueDurable     bool
 	DeclareTopology  bool
 	DLQ              string
+	DLQTTL           time.Duration // 0 => DLQ messages never expire
 	Autoscale        Autoscale
 }
 
@@ -208,6 +212,12 @@ func applyDefaults(cfg *File) error {
 	if *cfg.Defaults.RetryLimit < 0 {
 		return errors.New("defaults.retry_limit must be >= 0")
 	}
+	if cfg.Defaults.DLQTTLDays == nil {
+		cfg.Defaults.DLQTTLDays = new(defaultDLQTTLDays)
+	}
+	if *cfg.Defaults.DLQTTLDays < 0 {
+		return errors.New("defaults.dlq_ttl_days must be >= 0")
+	}
 	if cfg.Defaults.TimeoutMS <= 0 {
 		cfg.Defaults.TimeoutMS = 30000
 	}
@@ -275,6 +285,7 @@ func resolveJobs(cfg *File) ([]ResolvedJob, error) {
 				QueueDurable:     boolOrDefault(j.QueueDurable, true),
 				DeclareTopology:  declare,
 				DLQ:              firstNonEmpty(j.DLQ, firstNonEmpty(j.Queue, j.Name)+".dlq"),
+				DLQTTL:           time.Duration(intOrDefault(j.DLQTTLDays, *cfg.Defaults.DLQTTLDays)) * 24 * time.Hour,
 				Autoscale:        resolveAutoscale(j.Autoscale, cfg.Defaults.Autoscale),
 			}
 			if err := validateJob(rj); err != nil {
@@ -308,6 +319,9 @@ func validateJob(j ResolvedJob) error {
 	}
 	if j.RetryLimit < 0 {
 		return errors.New("retry_limit must be >= 0")
+	}
+	if j.DLQTTL < 0 {
+		return errors.New("dlq_ttl_days must be >= 0")
 	}
 	return j.Autoscale.Validate()
 }

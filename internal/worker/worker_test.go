@@ -265,3 +265,23 @@ func TestDLQMessage(t *testing.T) {
 		t.Error("original delivery headers were mutated")
 	}
 }
+
+func TestDLQMessageTTL(t *testing.T) {
+	tests := []struct {
+		name string
+		ttl  time.Duration
+		want string
+	}{
+		{name: "no ttl", ttl: 0, want: ""},
+		{name: "7 days", ttl: 7 * 24 * time.Hour, want: "604800000"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			job := testJob()
+			job.DLQTTL = tt.ttl
+			if got := dlqMessage(job, amqp.Delivery{}).Expiration; got != tt.want {
+				t.Fatalf("expiration = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

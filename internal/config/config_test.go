@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeConfig(t *testing.T, content string) string {
@@ -72,6 +73,27 @@ jobs:
 	}
 	if j.RetryLimit != 1 {
 		t.Fatalf("retry default=%d, want 1", j.RetryLimit)
+	}
+	if j.DLQTTL != 7*24*time.Hour {
+		t.Fatalf("dlq ttl default=%v, want 7 days", j.DLQTTL)
+	}
+}
+
+func TestDLQTTLDays(t *testing.T) {
+	jobs := loadJobs(t, `
+defaults: {url: "http://x/d", dlq_ttl_days: 3}
+servers:
+  a: {host: h, port: 5672, username: u, password: p, vhost: /}
+jobs:
+  - {name: inherit, server: a}
+  - {name: override, server: a, dlq_ttl_days: 14}
+  - {name: never, server: a, dlq_ttl_days: 0}
+`)
+	want := []time.Duration{3 * 24 * time.Hour, 14 * 24 * time.Hour, 0}
+	for i, w := range want {
+		if jobs[i].DLQTTL != w {
+			t.Errorf("%s: dlq ttl=%v, want %v", jobs[i].Name, jobs[i].DLQTTL, w)
+		}
 	}
 }
 
@@ -165,6 +187,7 @@ func TestValidationErrors(t *testing.T) {
 		{name: "bad regexp", job: `{name: j, server: a, block_patterns: "("}`, wantErr: "block_patterns"},
 		{name: "negative retry", job: `{name: j, server: a, retry_limit: -1}`, wantErr: "retry_limit"},
 		{name: "negative count", job: `{name: j, server: a, count: -1}`, wantErr: "count"},
+		{name: "negative dlq ttl", job: `{name: j, server: a, dlq_ttl_days: -1}`, wantErr: "dlq_ttl_days"},
 		{name: "unknown server", job: `{name: j, server: zz}`, wantErr: "unknown server"},
 	}
 	for _, tt := range tests {

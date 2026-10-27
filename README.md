@@ -122,6 +122,12 @@ HTTP 表单字段：`queueName`（job name）、`bodyData`（消息体）。
 
 失败重试耗尽后写入 DLQ（publisher confirm 确认后），再 ack 原消息（不再用 Redis 存失败任务）。停机时先等处理中的消息完成；超过 15s 则中断并放回原队列，不会进 DLQ。
 
+DLQ 消息默认 **7 天后自动过期**，由 RabbitMQ 直接丢弃：写入 DLQ 时给每条消息设置 `expiration`。用 `dlq_ttl_days` 配置（可以写在 `defaults` 里，job 里可以覆盖），`0` 表示永不过期。注意：
+
+- 只对设置之后新进 DLQ 的消息生效，DLQ 里已有的消息不会过期。需要清理老消息时，可以用 `purge-dlq`，或者在 RabbitMQ 上配置 `message-ttl` policy。
+- 重放（`replay-dlq`）回主队列的消息不带过期时间。如果它再次失败进入 DLQ，过期时间重新计算。
+- 过期的消息不会打日志，也不计入指标。如果 DLQ 配置了自己的 dead-letter exchange，过期消息会转发到那里。
+
 ## Admin API
 
 默认监听 `admin.host:admin.port`（示例 `0.0.0.0:8888`）。
@@ -331,7 +337,7 @@ kill -HUP <pid>                                                                 
 | 新增 job | 创建并开始消费 |
 | 删除 job | 处理完手上的消息后停止（最多等 15 秒，超时的消息退回队列） |
 | 只改了 `count` 和/或 `autoscale` | 直接扩缩容，不替换 worker。开启 autoscale 时 worker 数由它决定，`count` 不生效；在文件里关闭 autoscale 后恢复为 `count` |
-| 改了 `url`、`url_host`、`timeout_ms`、`retry_limit`、`prefetch`、`block_patterns`、`discard_match_jobs`、`encoding` | 平滑替换 worker |
+| 改了 `url`、`url_host`、`timeout_ms`、`retry_limit`、`prefetch`、`block_patterns`、`discard_match_jobs`、`encoding`、`dlq_ttl_days` | 平滑替换 worker |
 | 改了队列、exchange、路由、durable、`declare_topology` 或 server 连接参数 | 停掉后按新配置重建 |
 
 - 通过 Admin API 做的临时修改：只有文件里**同一项**改了才会被覆盖，其他保留。重建的 job 完全以文件为准。

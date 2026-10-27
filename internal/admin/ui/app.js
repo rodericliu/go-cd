@@ -433,6 +433,7 @@ function JobDetail({ job, onClose, act, ask }) {
       <div><dt>Completed</dt><dd>${fmt(job.completed)}</dd></div>
       <div><dt>Failed</dt><dd class=${job.failed > 0 ? 'warn' : ''}>${fmt(job.failed)}</dd></div>
       <div><dt>Consumers</dt><dd>${fmt(job.depth?.queue.consumers)}</dd></div>
+      <div><dt>DLQ TTL</dt><dd>${job.dlq_ttl_days > 0 ? t('facts.dlqTTLDays', { n: job.dlq_ttl_days }) : t('facts.dlqTTLNever')}</dd></div>
     </dl>
     <nav class="tabs">
       ${tabs.map((k) => html`<button key=${k} class=${tab === k ? 'active' : ''} onClick=${() => setTab(k)}>${t('tab.' + k)}</button>`)}

@@ -101,7 +101,7 @@
 | F-04 | 可选 `Host` / `url_host` | 请求 Host 头可指定 |
 | F-05 | 成功条件：HTTP 200 且 body trim 后大小写不敏感等于 `ok` | 单测覆盖 |
 | F-06 | 失败重试：首次失败后再重试 `retry_limit` 次（`0` = 不重试）；指数退避 + jitter | 日志可见 attempt |
-| F-07 | 重试耗尽写入 DLQ（默认 `{queue}.dlq`），broker 确认（publisher confirm + mandatory）后再 ack 原消息 | DLQ 可 peek/replay |
+| F-07 | 重试耗尽写入 DLQ（默认 `{queue}.dlq`），broker 确认（publisher confirm + mandatory）后再 ack 原消息；消息带 `expiration`（`dlq_ttl_days`，默认 7 天，0 不过期） | DLQ 可 peek/replay；超期未重放的消息由 broker 丢弃 |
 | F-08 | `block_patterns` 正则匹配；`discard_match_jobs=true` 时直接 ack 丢弃 | 可 Admin 动态改 |
 | F-09 | 默认声明 exchange / queue / bind / DLQ；可 `declare_topology: false` | passive 校验主队列与 DLQ |
 

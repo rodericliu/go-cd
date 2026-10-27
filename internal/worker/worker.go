@@ -8,6 +8,7 @@ import (
 	"maps"
 	"math/rand/v2"
 	"regexp"
+	"strconv"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -355,7 +356,7 @@ func dlqMessage(job config.ResolvedJob, d amqp.Delivery) amqp.Publishing {
 	headers["x-job"] = job.LogicName
 	headers["x-failed-at"] = time.Now().UTC().Format(time.RFC3339)
 
-	return amqp.Publishing{
+	msg := amqp.Publishing{
 		Headers:         headers,
 		ContentType:     d.ContentType,
 		ContentEncoding: d.ContentEncoding,
@@ -363,6 +364,12 @@ func dlqMessage(job config.ResolvedJob, d amqp.Delivery) amqp.Publishing {
 		DeliveryMode:    amqp.Persistent,
 		Timestamp:       time.Now(),
 	}
+	// Per-message TTL: the broker drops the message once it has sat in the
+	// DLQ this long. Replayed messages are republished without it.
+	if job.DLQTTL > 0 {
+		msg.Expiration = strconv.FormatInt(job.DLQTTL.Milliseconds(), 10)
+	}
+	return msg
 }
 
 // Try posts a one-off body without touching the queue (admin).

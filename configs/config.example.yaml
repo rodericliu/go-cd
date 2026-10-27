@@ -11,6 +11,8 @@ defaults:
   prefetch: 10
   # declare exchange/queue/dlq on start; set false if topology is managed elsewhere
   declare_topology: true
+  # DLQ 消息多少天后由 RabbitMQ 自动丢弃（仅对新进入 DLQ 的消息生效），0 表示永不过期
+  dlq_ttl_days: 7
   # 按队列积压自动调整 worker 数（README「按积压自动扩缩容」）；job 里可逐项覆盖
   # autoscale:
   #   enabled: false

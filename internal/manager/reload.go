@@ -80,6 +80,7 @@ func copyRuntime(dst *config.ResolvedJob, src config.ResolvedJob) {
 	dst.Prefetch = src.Prefetch
 	dst.BlockPatterns = src.BlockPatterns
 	dst.DiscardMatchJobs = src.DiscardMatchJobs
+	dst.DLQTTL = src.DLQTTL
 	dst.Autoscale = src.Autoscale
 }
 
@@ -110,6 +111,9 @@ func applyFileChanges(dst *config.ResolvedJob, old, cur config.ResolvedJob) {
 	}
 	if old.DiscardMatchJobs != cur.DiscardMatchJobs {
 		dst.DiscardMatchJobs = cur.DiscardMatchJobs
+	}
+	if old.DLQTTL != cur.DLQTTL {
+		dst.DLQTTL = cur.DLQTTL
 	}
 }
 

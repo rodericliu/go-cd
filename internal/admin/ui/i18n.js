@@ -70,6 +70,9 @@ const zh = {
   'reload.applying': '应用中…',
   'reload.done': '配置已重新加载',
 
+  'facts.dlqTTLDays': '{n} 天',
+  'facts.dlqTTLNever': '永不过期',
+
   'tab.settings': '设置',
   'tab.messages': '消息',
   'tab.try': '试投',
@@ -206,6 +209,9 @@ const en = {
   'reload.apply': 'Apply',
   'reload.applying': 'Applying…',
   'reload.done': 'Config reloaded',
+
+  'facts.dlqTTLDays': ({ n }) => `${n} ${plural(n, 'day', 'days')}`,
+  'facts.dlqTTLNever': 'Never',
 
   'tab.settings': 'Settings',
   'tab.messages': 'Messages',
